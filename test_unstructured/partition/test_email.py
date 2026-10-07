@@ -130,6 +130,24 @@ def test_partition_email_partitions_an_html_part_with_quoted_printable_encoded_I
 # -- edge-cases ----------------------------------------------------------------------------------
 
 
+def test_partition_email_does_not_split_hyphenated_values_in_the_body():
+    """`.eml` bodies are dense with short `Field: value` lines, the worst case for the bug.
+
+    Each of these lines used to become one element per hyphen-delimited fragment, so a regex
+    or PII pass downstream could never match the value.
+    """
+    assert [e.text for e in partition_email(example_doc_path("eml/hyphenated-values.eml"))] == [
+        "Customer: Acme Corp",
+        "Phone: 555-123-4567",
+        "SSN: 456-78-9012",
+        "Effective: 2026-08-19",
+        "Card: 4111-1111-1111-1111",
+        "Contact: Jean-Luc Picard",
+        "Service: my-service-prod",
+        "Thanks",
+    ]
+
+
 def test_partition_email_accepts_a_whitespace_only_file():
     """Should produce no elements but should not raise an exception."""
     assert partition_email(example_doc_path("eml/empty.eml")) == []
@@ -372,11 +390,16 @@ def test_partition_email_can_process_attachments():
 
 
 def test_partition_email_silently_skips_attachments_it_cannot_partition():
-    elements = partition_email(
-        example_doc_path("eml/mime-attach-mp3.eml"), process_attachments=True
-    )
+    """Attachments that raise EXPECTED_ATTACHMENT_ERRORS (e.g. ImportError) are skipped."""
+    from unittest.mock import patch
 
-    # -- no exception is raised --
+    with patch("unstructured.partition.auto.partition") as mock_partition:
+        mock_partition.side_effect = ImportError("No module named 'whisper'")
+        elements = partition_email(
+            example_doc_path("eml/mime-attach-mp3.eml"), process_attachments=True
+        )
+
+    # -- No exception; attachment skipped (ImportError is in EXPECTED_ATTACHMENT_ERRORS). --
     assert elements == [
         # -- the email body is partitioned --
         NarrativeText("This is an email with an MP3 attachment."),
@@ -521,9 +544,28 @@ class DescribeEmailPartitionerOptions:
         ctx = EmailPartitioningContext(metadata_last_modified=metadata_last_modified)
         assert ctx.metadata_last_modified == metadata_last_modified
 
-    def and_it_uses_the_msg_Date_header_date_when_metadata_last_modified_was_not_provided(self):
+    def and_it_uses_the_msg_Date_header_date_when_metadata_last_modified_was_not_provided(
+        self,
+    ):
         ctx = EmailPartitioningContext(example_doc_path("eml/simple-rfc-822.eml"))
         assert ctx.metadata_last_modified == "2024-10-01T17:34:56+00:00"
+
+    @pytest.mark.parametrize(
+        ("date_format", "expected_date"),
+        [
+            ("test-iso-8601-date.eml", "2025-07-29T12:42:06+00:00"),
+            ("test-rfc2822-date.eml", "2025-07-29T12:42:06+00:00"),
+        ],
+    )
+    def and_it_correctly_parses_various_date_formats_like_the_ones_that_occur_in_the_wild(
+        self, date_format: str, expected_date: str
+    ):
+        ctx = EmailPartitioningContext(example_doc_path(f"eml/{date_format}"))
+        assert ctx.metadata_last_modified == expected_date
+
+    def and_it_returns_none_when_date_header_is_invalid(self):
+        ctx = EmailPartitioningContext(example_doc_path("eml/test-invalid-date.eml"))
+        assert ctx._sent_date is None
 
     def and_it_falls_back_to_filesystem_last_modified_when_no_Date_header_is_present(
         self, get_last_modified_date_: Mock

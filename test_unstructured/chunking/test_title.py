@@ -40,8 +40,9 @@ def test_it_chunks_text_followed_by_table_together_when_both_fit():
 
     chunks = chunk_by_title(elements, combine_text_under_n_chars=0)
 
-    assert len(chunks) == 1
+    assert len(chunks) == 2
     assert isinstance(chunks[0], CompositeElement)
+    assert isinstance(chunks[1], Table)
 
 
 def test_it_chunks_table_followed_by_text_together_when_both_fit():
@@ -50,8 +51,9 @@ def test_it_chunks_table_followed_by_text_together_when_both_fit():
     # -- disable chunk combining so we test pre-chunking behavior, not chunk-combining --
     chunks = chunk_by_title(elements, combine_text_under_n_chars=0)
 
-    assert len(chunks) == 1
-    assert isinstance(chunks[0], CompositeElement)
+    assert len(chunks) == 2
+    assert isinstance(chunks[0], Table)
+    assert isinstance(chunks[1], CompositeElement)
 
 
 def test_it_splits_oversized_table():
@@ -61,6 +63,83 @@ def test_it_splits_oversized_table():
 
     assert len(chunks) == 5
     assert all(isinstance(chunk, TableChunk) for chunk in chunks)
+
+
+def test_skip_table_chunking_passes_oversized_table_through_unchanged():
+    elements = elements_from_json(input_path("chunking/table_2000.json"))
+
+    chunks = chunk_by_title(elements, skip_table_chunking=True)
+
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], Table)
+
+
+def test_skip_table_chunking_does_not_combine_table_with_adjacent_text():
+    table_text = "cell " * 200
+    table = Table(table_text.strip())
+    text_before = Text("Hello world")
+    text_after = Text("Goodbye world")
+
+    chunks = chunk_by_title(
+        [text_before, table, text_after],
+        max_characters=5000,
+        combine_text_under_n_chars=5000,
+        skip_table_chunking=True,
+    )
+
+    assert isinstance(chunks[0], CompositeElement)
+    assert isinstance(chunks[1], Table)
+    assert isinstance(chunks[2], CompositeElement)
+    assert chunks[1].text == table_text.strip()
+
+
+def test_it_repeats_table_headers_by_default_but_can_opt_out():
+    table_html = (
+        "<table>"
+        "<thead>"
+        "<tr><th>Header A</th><th>Header B</th></tr>"
+        "<tr><th>Subhead A</th><th>Subhead B</th></tr>"
+        "</thead>"
+        "<tbody>"
+        "<tr><td>Body 1</td><td>Alpha</td></tr>"
+        "<tr><td>Body 2</td><td>Bravo</td></tr>"
+        "<tr><td>Body 3</td><td>Charlie</td></tr>"
+        "<tr><td>Body 4</td><td>Delta</td></tr>"
+        "</tbody>"
+        "</table>"
+    )
+    table_text = (
+        "Header A Header B\n"
+        "Subhead A Subhead B\n"
+        "Body 1 Alpha\n"
+        "Body 2 Bravo\n"
+        "Body 3 Charlie\n"
+        "Body 4 Delta"
+    )
+    table = Table(table_text, metadata=ElementMetadata(text_as_html=table_html))
+
+    repeated_header_chunks = chunk_by_title(
+        [table], combine_text_under_n_chars=0, max_characters=55
+    )
+    opt_out_chunks = chunk_by_title(
+        [table],
+        combine_text_under_n_chars=0,
+        max_characters=55,
+        repeat_table_headers=False,
+    )
+
+    assert len(repeated_header_chunks) == 4
+    assert all(isinstance(chunk, TableChunk) for chunk in repeated_header_chunks)
+    assert [chunk.text for chunk in repeated_header_chunks] == [
+        "Header A Header B Subhead A Subhead B Body 1 Alpha",
+        "Header A Header B Subhead A Subhead B Body 2 Bravo",
+        "Header A Header B Subhead A Subhead B Body 3 Charlie",
+        "Header A Header B Subhead A Subhead B Body 4 Delta",
+    ]
+    assert [chunk.text for chunk in opt_out_chunks] == [
+        "Header A Header B Subhead A Subhead B Body 1 Alpha",
+        "Body 2 Bravo Body 3 Charlie Body 4 Delta",
+    ]
 
 
 def test_it_starts_new_chunk_for_table_after_full_text_chunk():
@@ -116,7 +195,7 @@ def test_it_splits_elements_by_title_and_table():
 
     chunks = chunk_by_title(elements, combine_text_under_n_chars=0, include_orig_elements=True)
 
-    assert len(chunks) == 3
+    assert len(chunks) == 4
     # --
     chunk = chunks[0]
     assert isinstance(chunk, CompositeElement)
@@ -124,10 +203,15 @@ def test_it_splits_elements_by_title_and_table():
         Title("A Great Day"),
         Text("Today is a great day."),
         Text("It is sunny outside."),
-        Table("Heading\nCell text"),
     ]
     # --
     chunk = chunks[1]
+    assert isinstance(chunk, Table)
+    assert len(chunk.metadata.orig_elements) == 1
+    assert isinstance(chunk.metadata.orig_elements[0], Table)
+    assert chunk.metadata.orig_elements[0].text == "Heading\nCell text"
+    # --
+    chunk = chunks[2]
     assert isinstance(chunk, CompositeElement)
     assert chunk.metadata.orig_elements == [
         Title("An Okay Day"),
@@ -135,7 +219,7 @@ def test_it_splits_elements_by_title_and_table():
         Text("It is rainy outside."),
     ]
     # --
-    chunk = chunks[2]
+    chunk = chunks[3]
     assert isinstance(chunk, CompositeElement)
     assert chunk.metadata.orig_elements == [
         Title("A Bad Day"),
@@ -162,15 +246,18 @@ def test_chunk_by_title():
 
     chunks = chunk_by_title(elements, combine_text_under_n_chars=0, include_orig_elements=False)
 
-    assert chunks == [
-        CompositeElement(
-            "A Great Day\n\nToday is a great day.\n\nIt is sunny outside.\n\nHeading Cell text"
-        ),
-        CompositeElement("An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."),
-        CompositeElement(
-            "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside.",
-        ),
-    ]
+    assert len(chunks) == 4
+    assert chunks[0] == CompositeElement(
+        "A Great Day\n\nToday is a great day.\n\nIt is sunny outside."
+    )
+    assert isinstance(chunks[1], Table)
+    assert chunks[1].text == "Heading\nCell text"
+    assert chunks[2] == CompositeElement(
+        "An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."
+    )
+    assert chunks[3] == CompositeElement(
+        "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside."
+    )
     assert chunks[0].metadata == ElementMetadata(emphasized_text_contents=["Day", "day"])
 
 
@@ -190,16 +277,17 @@ def test_chunk_by_title_separates_by_page_number():
     ]
     chunks = chunk_by_title(elements, multipage_sections=False, combine_text_under_n_chars=0)
 
-    assert chunks == [
-        CompositeElement(
-            "A Great Day",
-        ),
-        CompositeElement("Today is a great day.\n\nIt is sunny outside.\n\nHeading Cell text"),
-        CompositeElement("An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."),
-        CompositeElement(
-            "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside.",
-        ),
-    ]
+    assert len(chunks) == 5
+    assert chunks[0] == CompositeElement("A Great Day")
+    assert chunks[1] == CompositeElement("Today is a great day.\n\nIt is sunny outside.")
+    assert isinstance(chunks[2], Table)
+    assert chunks[2].text == "Heading\nCell text"
+    assert chunks[3] == CompositeElement(
+        "An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."
+    )
+    assert chunks[4] == CompositeElement(
+        "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside."
+    )
 
 
 def test_chuck_by_title_respects_multipage():
@@ -217,15 +305,18 @@ def test_chuck_by_title_respects_multipage():
         CheckBox(),
     ]
     chunks = chunk_by_title(elements, multipage_sections=True, combine_text_under_n_chars=0)
-    assert chunks == [
-        CompositeElement(
-            "A Great Day\n\nToday is a great day.\n\nIt is sunny outside.\n\nHeading Cell text"
-        ),
-        CompositeElement("An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."),
-        CompositeElement(
-            "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside.",
-        ),
-    ]
+    assert len(chunks) == 4
+    assert chunks[0] == CompositeElement(
+        "A Great Day\n\nToday is a great day.\n\nIt is sunny outside."
+    )
+    assert isinstance(chunks[1], Table)
+    assert chunks[1].text == "Heading\nCell text"
+    assert chunks[2] == CompositeElement(
+        "An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."
+    )
+    assert chunks[3] == CompositeElement(
+        "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside."
+    )
 
 
 def test_chunk_by_title_groups_across_pages():
@@ -244,15 +335,18 @@ def test_chunk_by_title_groups_across_pages():
     ]
     chunks = chunk_by_title(elements, multipage_sections=True, combine_text_under_n_chars=0)
 
-    assert chunks == [
-        CompositeElement(
-            "A Great Day\n\nToday is a great day.\n\nIt is sunny outside.\n\nHeading Cell text"
-        ),
-        CompositeElement("An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."),
-        CompositeElement(
-            "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside.",
-        ),
-    ]
+    assert len(chunks) == 4
+    assert chunks[0] == CompositeElement(
+        "A Great Day\n\nToday is a great day.\n\nIt is sunny outside."
+    )
+    assert isinstance(chunks[1], Table)
+    assert chunks[1].text == "Heading\nCell text"
+    assert chunks[2] == CompositeElement(
+        "An Okay Day\n\nToday is an okay day.\n\nIt is rainy outside."
+    )
+    assert chunks[3] == CompositeElement(
+        "A Bad Day\n\nToday is a bad day.\n\nIt is storming outside."
+    )
 
 
 def test_add_chunking_strategy_on_partition_html():
@@ -287,6 +381,20 @@ def test_add_chunking_strategy_respects_max_characters():
     for chunk_element in chunk_elements:
         assert isinstance(chunk_element, Text)
         assert len(chunk_element.text) <= 100
+    assert chunk_elements != elements
+    assert chunk_elements == chunks
+
+
+def test_add_chunking_strategy_forwards_repeat_table_headers():
+    filename = "example-docs/example-10k-1p.html"
+    chunk_elements = partition_html(
+        filename,
+        chunking_strategy="by_title",
+        repeat_table_headers=False,
+    )
+    elements = partition_html(filename)
+    chunks = chunk_by_title(elements, repeat_table_headers=False)
+
     assert chunk_elements != elements
     assert chunk_elements == chunks
 
@@ -465,6 +573,59 @@ class Describe_chunk_by_title:
         _, opts = _chunk_by_title_.call_args.args
         assert opts.include_orig_elements is expected_value
 
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_value"),
+        [
+            ({"repeat_table_headers": True}, True),
+            ({"repeat_table_headers": False}, False),
+            ({"repeat_table_headers": None}, True),
+            ({}, True),
+        ],
+    )
+    def it_supports_the_repeat_table_headers_option(
+        self, kwargs: dict[str, Any], expected_value: bool, _chunk_by_title_: Mock
+    ):
+        # -- this line would raise if "repeat_table_headers" was not an available parameter on
+        # -- `chunk_by_title()`.
+        chunk_by_title([], **kwargs)
+
+        _, opts = _chunk_by_title_.call_args.args
+        assert opts.repeat_table_headers is expected_value
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_value"),
+        [
+            ({"skip_table_chunking": True}, True),
+            ({"skip_table_chunking": False}, False),
+            ({"skip_table_chunking": None}, False),
+            ({}, False),
+        ],
+    )
+    def it_supports_the_skip_table_chunking_option(
+        self, kwargs: dict[str, Any], expected_value: bool, _chunk_by_title_: Mock
+    ):
+        chunk_by_title([], **kwargs)
+
+        _, opts = _chunk_by_title_.call_args.args
+        assert opts.skip_table_chunking is expected_value
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_value"),
+        [
+            ({"isolate_table": True}, True),
+            ({"isolate_table": False}, False),
+            ({"isolate_table": None}, True),
+            ({}, True),
+        ],
+    )
+    def it_supports_the_isolate_table_option(
+        self, kwargs: dict[str, Any], expected_value: bool, _chunk_by_title_: Mock
+    ):
+        chunk_by_title([], **kwargs)
+
+        _, opts = _chunk_by_title_.call_args.args
+        assert opts.isolate_table is expected_value
+
     # -- fixtures --------------------------------------------------------------------------------
 
     @pytest.fixture()
@@ -539,3 +700,191 @@ class Describe_ByTitleChunkingOptions:
     ):
         opts = _ByTitleChunkingOptions(multipage_sections=multipage_sections)
         assert opts.multipage_sections is expected_value
+
+
+# ================================================================================================
+# TOKEN-BASED CHUNKING INTEGRATION TESTS
+# ================================================================================================
+
+
+class DescribeTokenBasedChunking:
+    """Integration tests for token-based chunking with chunk_by_title()."""
+
+    @pytest.fixture
+    def _tiktoken_installed(self):
+        """Skip test if tiktoken is not installed."""
+        pytest.importorskip("tiktoken")
+
+    def it_chunks_elements_by_token_count(self, _tiktoken_installed: None):
+        """Test that chunk_by_title works with max_tokens parameter and respects token limits."""
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        elements: list[Element] = [
+            Title("Introduction"),
+            Text("This is a test document with some text content."),
+            Text("Here is more content that should be chunked appropriately."),
+        ]
+
+        chunks = chunk_by_title(
+            elements,
+            max_tokens=20,
+            tokenizer="cl100k_base",
+            combine_text_under_n_chars=0,
+        )
+
+        # -- verify chunks were created --
+        assert len(chunks) >= 1
+        assert all(isinstance(chunk, (CompositeElement, Table, TableChunk)) for chunk in chunks)
+
+        # -- verify each chunk respects the token limit --
+        for chunk in chunks:
+            token_count = len(enc.encode(chunk.text))
+            assert token_count <= 20, f"Chunk exceeded token limit: {token_count} tokens"
+
+        # -- verify the first chunk contains expected content --
+        assert "Introduction" in chunks[0].text
+
+    def it_respects_new_after_n_tokens_soft_limit(self, _tiktoken_installed: None):
+        """Test that new_after_n_tokens creates smaller chunks with correct content."""
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        elements: list[Element] = [
+            Title("Section 1"),
+            Text("Some text for section one."),
+            Text("More text for section one."),
+            Title("Section 2"),
+            Text("Text for section two."),
+        ]
+
+        # -- with a low soft limit, each section should become its own chunk --
+        chunks = chunk_by_title(
+            elements,
+            max_tokens=100,
+            new_after_n_tokens=10,
+            tokenizer="cl100k_base",
+            combine_text_under_n_chars=0,
+        )
+
+        # -- verify we get multiple chunks --
+        assert len(chunks) >= 2
+
+        # -- verify each chunk respects the hard limit --
+        for chunk in chunks:
+            token_count = len(enc.encode(chunk.text))
+            assert token_count <= 100, f"Chunk exceeded token limit: {token_count} tokens"
+
+        # -- verify content is distributed across chunks --
+        all_text = " ".join(chunk.text for chunk in chunks)
+        assert "Section 1" in all_text
+        assert "Section 2" in all_text
+
+    def it_rejects_max_tokens_and_max_characters_together(self, _tiktoken_installed: None):
+        """Test that specifying both max_tokens and max_characters raises ValueError."""
+        elements: list[Element] = [Text("Some text")]
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            chunk_by_title(
+                elements,
+                max_tokens=100,
+                max_characters=500,
+                tokenizer="cl100k_base",
+            )
+
+    def it_rejects_max_tokens_without_tokenizer(self, _tiktoken_installed: None):
+        """Test that max_tokens requires tokenizer to be specified."""
+        elements: list[Element] = [Text("Some text")]
+
+        with pytest.raises(ValueError, match="'tokenizer' is required"):
+            chunk_by_title(elements, max_tokens=100)
+
+    def it_accepts_model_name_as_tokenizer(self, _tiktoken_installed: None):
+        """Test that model names like 'gpt-4' work as tokenizer."""
+        import tiktoken
+
+        # -- gpt-4 uses cl100k_base encoding --
+        enc = tiktoken.encoding_for_model("gpt-4")
+        elements: list[Element] = [
+            Title("Test"),
+            Text("Some test content."),
+        ]
+
+        chunks = chunk_by_title(
+            elements,
+            max_tokens=50,
+            tokenizer="gpt-4",
+            combine_text_under_n_chars=0,
+        )
+
+        assert len(chunks) >= 1
+
+        # -- verify token counts are within limit --
+        for chunk in chunks:
+            token_count = len(enc.encode(chunk.text))
+            assert token_count <= 50, f"Chunk exceeded token limit: {token_count} tokens"
+
+        # -- verify content --
+        assert chunks[0].text == "Test\n\nSome test content."
+
+    def it_splits_oversized_element_respecting_token_limit(self, _tiktoken_installed: None):
+        """Test that oversized elements are split correctly by token count."""
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        # -- create a text that will definitely need to be split (>10 tokens) --
+        long_text = "The quick brown fox jumps over the lazy dog. " * 10
+        elements: list[Element] = [Text(long_text)]
+
+        chunks = chunk_by_title(
+            elements,
+            max_tokens=15,
+            tokenizer="cl100k_base",
+            combine_text_under_n_chars=0,
+        )
+
+        # -- should produce multiple chunks --
+        assert len(chunks) > 1
+
+        # -- each chunk should respect the token limit --
+        for chunk in chunks:
+            token_count = len(enc.encode(chunk.text))
+            assert token_count <= 15, f"Chunk exceeded token limit: {token_count} tokens"
+
+    def it_applies_token_based_overlap_in_split_chunks(self, _tiktoken_installed: None):
+        """Test that overlap in token mode is measured in tokens, not characters."""
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        # -- create text that will be split into multiple chunks --
+        long_text = "Apple banana cherry date elderberry fig grape honeydew. " * 5
+        elements: list[Element] = [Text(long_text)]
+
+        chunks = chunk_by_title(
+            elements,
+            max_tokens=12,
+            tokenizer="cl100k_base",
+            overlap=3,  # 3 tokens of overlap
+            combine_text_under_n_chars=0,
+        )
+
+        # -- should produce multiple chunks --
+        assert len(chunks) >= 2
+
+        # -- verify overlap: second chunk should start with tokens from end of first --
+        if len(chunks) >= 2:
+            # -- the overlap tail from chunk 0 should appear at start of chunk 1 --
+            first_chunk_text = chunks[0].text
+            second_chunk_text = chunks[1].text
+
+            # -- the overlap should be approximately 3 tokens worth of text --
+            # -- verify second chunk starts with content from end of first chunk --
+            # -- (the overlap mechanism prepends tail to remainder) --
+            assert len(second_chunk_text) > 0
+            # -- verify some content from first chunk appears at start of second --
+            first_chunk_words = first_chunk_text.split()
+            assert any(word in second_chunk_text for word in first_chunk_words[-3:])
+            # -- verify each chunk respects limits --
+            for chunk in chunks:
+                token_count = len(enc.encode(chunk.text))
+                assert token_count <= 12, f"Chunk exceeded token limit: {token_count} tokens"

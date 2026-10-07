@@ -4,7 +4,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-import requests
+from markdown.extensions.fenced_code import FencedCodeExtension
 from pytest_mock import MockFixture
 
 from test_unstructured.unit_utils import assert_round_trips_through_JSON, example_doc_path
@@ -12,6 +12,18 @@ from unstructured.chunking.title import chunk_by_title
 from unstructured.documents.elements import ElementType, Title
 from unstructured.partition.md import partition_md
 from unstructured.partition.utils.constants import UNSTRUCTURED_INCLUDE_DEBUG_METADATA
+
+
+@pytest.mark.parametrize("marker", ["1.", "-"])
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_partition_md_recognizes_loose_and_tight_lists(marker: str, separator: str):
+    text = separator.join(f"{marker} list item {word}." for word in ["one", "two", "three"])
+
+    elements = partition_md(text=text, languages=[""])
+
+    assert [e.category for e in elements] == ["ListItem"] * 3
+    assert [e.text for e in elements] == [f"list item {word}." for word in ["one", "two", "three"]]
+    assert [e.metadata.category_depth for e in elements] == [1, 1, 1]
 
 
 def test_partition_md_from_filename():
@@ -60,7 +72,7 @@ def test_partition_md_from_url():
         status_code=200,
         headers={"Content-Type": "text/markdown"},
     )
-    with patch.object(requests, "get", return_value=response) as _:
+    with patch("unstructured.partition.md.safe_get", return_value=response) as _:
         elements = partition_md(url="https://fake.url")
 
     assert len(elements) > 0
@@ -77,7 +89,10 @@ def test_partition_md_from_url_raises_with_bad_status_code():
         status_code=500,
         headers={"Content-Type": "text/html"},
     )
-    with patch.object(requests, "get", return_value=response) as _, pytest.raises(ValueError):
+    with (
+        patch("unstructured.partition.md.safe_get", return_value=response) as _,
+        pytest.raises(ValueError),
+    ):
         partition_md(url="https://fake.url")
 
 
@@ -91,7 +106,10 @@ def test_partition_md_from_url_raises_with_bad_content_type():
         status_code=200,
         headers={"Content-Type": "application/json"},
     )
-    with patch.object(requests, "get", return_value=response) as _, pytest.raises(ValueError):
+    with (
+        patch("unstructured.partition.md.safe_get", return_value=response) as _,
+        pytest.raises(ValueError),
+    ):
         partition_md(url="https://fake.url")
 
 
@@ -248,6 +266,15 @@ def test_partition_md_respects_detect_language_per_element():
     assert langs == [["eng"], ["spa", "eng"], ["eng"], ["eng"], ["spa"]]
 
 
+def test_partition_md_languages_empty_disables_detection():
+    """Passing languages=[\"\"] disables language detection (no metadata.languages set)."""
+    filename = "example-docs/README.md"
+    elements = partition_md(filename=filename, languages=[""])
+    # When detection is disabled, metadata.languages should not be set (None)
+    for el in elements:
+        assert el.metadata.languages is None
+
+
 def test_partition_md_parse_table():
     filename = example_doc_path("simple-table.md")
     elements = partition_md(filename=filename)
@@ -332,3 +359,53 @@ def test_partition_fenced_code():
     assert elements[3].text == expected_xml
 
     assert elements[4].text == expected_xml
+
+
+def test_partition_md_custom_extensions_parameter():
+    """User can override markdown extensions via `extensions` kwarg (fixes #4006)."""
+    text = """```bash
+# create the container
+docker run -dt --name unstructured downloads.unstructured.io/unstructured-io/unstructured:latest
+```"""
+
+    expected_body = (
+        "# create the container\n"
+        "docker run -dt --name unstructured "
+        "downloads.unstructured.io/unstructured-io/unstructured:latest"
+    )
+
+    # Without fenced_code, ``#`` inside the fence is parsed as a heading (undesired).
+    elements_tables_only = partition_md(text=text, extensions=["tables"])
+    assert any(isinstance(el, Title) for el in elements_tables_only)
+
+    # Default and explicit fenced_code keep the block as one element (CodeSnippet from HTML).
+    assert len(partition_md(text=text)) == 1
+    elements_fenced = partition_md(text=text, extensions=["fenced_code"])
+    assert len(elements_fenced) == 1
+    assert elements_fenced[0].category == ElementType.CODE_SNIPPET
+    assert elements_fenced[0].text == expected_body
+
+    # Extension instances (normal Python-Markdown API) match string extension names.
+    elements_instance = partition_md(text=text, extensions=[FencedCodeExtension()])
+    assert elements_instance == elements_fenced
+
+
+def test_partition_md_extensions_not_list_raises():
+    with pytest.raises(ValueError, match="'extensions' must be a list"):
+        partition_md(text="# Hi", extensions=("tables",))  # type: ignore[arg-type]
+
+
+def test_partition_md_extensions_invalid_item_raises():
+    with pytest.raises(ValueError, match="Each entry in 'extensions'"):
+        partition_md(text="# Hi", extensions=[42])  # type: ignore[list-item]
+
+
+def test_partition_md_tables_only_differs_from_default_for_code_fence():
+    """Without ``fenced_code``, ``#`` inside a fence can become a Title (see #4006)."""
+    text = """```bash
+# line
+```"""
+    default_el = partition_md(text=text)[0]
+    tables_only_els = partition_md(text=text, extensions=["tables"])
+    assert default_el.category == ElementType.CODE_SNIPPET
+    assert any(e.category == ElementType.TITLE for e in tables_only_els)

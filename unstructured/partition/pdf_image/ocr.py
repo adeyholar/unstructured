@@ -5,7 +5,6 @@ import tempfile
 from typing import IO, TYPE_CHECKING, Any, List, Optional, cast
 
 import numpy as np
-import pdf2image
 
 # NOTE(yuming): Rename PIL.Image to avoid conflict with
 # unstructured.documents.elements.Image
@@ -16,7 +15,7 @@ from unstructured.documents.elements import ElementType
 from unstructured.metrics.table.table_formats import SimpleTableCell
 from unstructured.partition.common.lang import tesseract_to_paddle_language
 from unstructured.partition.pdf_image.analysis.layout_dump import OCRLayoutDumper
-from unstructured.partition.pdf_image.pdf_image_utils import valid_text
+from unstructured.partition.pdf_image.pdf_image_utils import convert_pdf_to_image, valid_text
 from unstructured.partition.pdf_image.pdfminer_processing import (
     aggregate_embedded_text_by_block,
     bboxes1_is_almost_subregion_of_bboxes2,
@@ -24,6 +23,7 @@ from unstructured.partition.pdf_image.pdfminer_processing import (
 from unstructured.partition.utils.config import env_config
 from unstructured.partition.utils.constants import OCR_AGENT_PADDLE, OCR_AGENT_TESSERACT, OCRMode
 from unstructured.partition.utils.ocr_models.ocr_interface import OCRAgent
+from unstructured.telemetry import mark_partition_ocr_used, mark_partition_table_extraction
 from unstructured.utils import requires_dependencies
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ def process_data_with_ocr(
     ocr_agent: str = OCR_AGENT_TESSERACT,
     ocr_languages: str = "eng",
     ocr_mode: str = OCRMode.FULL_PAGE.value,
-    pdf_image_dpi: int = 200,
+    pdf_image_dpi: int = env_config.PDF_RENDER_DPI,
     ocr_layout_dumper: Optional[OCRLayoutDumper] = None,
     password: Optional[str] = None,
     table_ocr_agent: str = OCR_AGENT_TESSERACT,
@@ -69,7 +69,8 @@ def process_data_with_ocr(
         page and will be merged with the output layout. If choose "individual_blocks" OCR,
         OCR is performed on individual elements by cropping the image.
 
-    - pdf_image_dpi (int, optional): DPI (dots per inch) for processing PDF images. Defaults to 200.
+    - pdf_image_dpi (int, optional): DPI (dots per inch) for processing PDF images. Defaults to
+      env_config.PDF_RENDER_DPI's value.
 
     - ocr_layout_dumper (OCRLayoutDumper, optional): The OCR layout dumper to save the OCR layout.
 
@@ -111,7 +112,7 @@ def process_file_with_ocr(
     ocr_agent: str = OCR_AGENT_TESSERACT,
     ocr_languages: str = "eng",
     ocr_mode: str = OCRMode.FULL_PAGE.value,
-    pdf_image_dpi: int = 200,
+    pdf_image_dpi: int = env_config.PDF_RENDER_DPI,
     ocr_layout_dumper: Optional[OCRLayoutDumper] = None,
     password: Optional[str] = None,
     table_ocr_agent: str = OCR_AGENT_TESSERACT,
@@ -140,7 +141,8 @@ def process_file_with_ocr(
         page and will be merged with the output layout. If choose "individual_blocks" OCR,
         OCR is performed on individual elements by cropping the image.
 
-    - pdf_image_dpi (int, optional): DPI (dots per inch) for processing PDF images. Defaults to 200.
+    - pdf_image_dpi (int, optional): DPI (dots per inch) for processing PDF images. Defaults to
+      env_config.PDF_RENDER_DPI.
 
     Returns:
         DocumentLayout: The merged layout information obtained after OCR processing.
@@ -172,14 +174,15 @@ def process_file_with_ocr(
                 return DocumentLayout.from_pages(merged_page_layouts)
         else:
             with tempfile.TemporaryDirectory() as temp_dir:
-                _image_paths = pdf2image.convert_from_path(
+                _image_paths = convert_pdf_to_image(
                     filename,
                     dpi=pdf_image_dpi,
                     output_folder=temp_dir,
-                    paths_only=True,
-                    userpw=password or "",
+                    path_only=True,
+                    password=password,
                 )
                 image_paths = cast(List[str], _image_paths)
+
                 for i, image_path in enumerate(image_paths):
                     extracted_regions = extracted_layout[i] if i < len(extracted_layout) else None
                     with PILImage.open(image_path) as image:
@@ -195,6 +198,7 @@ def process_file_with_ocr(
                             table_ocr_agent=table_ocr_agent,
                         )
                         merged_page_layouts.append(merged_page_layout)
+
                 return DocumentLayout.from_pages(merged_page_layouts)
     except Exception as e:
         if os.path.isdir(filename) or os.path.isfile(filename):
@@ -228,6 +232,7 @@ def supplement_page_layout_with_ocr(
         language = tesseract_to_paddle_language(ocr_languages)
     _ocr_agent = OCRAgent.get_instance(ocr_agent_module=ocr_agent, language=language)
     if ocr_mode == OCRMode.FULL_PAGE.value:
+        mark_partition_ocr_used()
         ocr_layout = _ocr_agent.get_layout_from_image(image)
         if ocr_layout_dumper:
             ocr_layout_dumper.add_ocred_page(ocr_layout.as_list())
@@ -252,6 +257,7 @@ def supplement_page_layout_with_ocr(
             )
             # Note(yuming): instead of getting OCR layout, we just need
             # the text extraced from OCR for individual elements
+            mark_partition_ocr_used()
             text_from_ocr = _ocr_agent.get_text_from_image(cropped_image)
             page_layout.elements_array.texts[i] = text_from_ocr
     else:
@@ -321,6 +327,7 @@ def supplement_element_with_table_extraction(
             table_element_image=cropped_image,
             ocr_agent=ocr_agent,
         )
+        mark_partition_table_extraction()
         tatr_cells = tables_agent.predict(
             cropped_image, ocr_tokens=table_tokens, result_format="cells"
         )
@@ -344,6 +351,7 @@ def get_table_tokens(
 ) -> List[dict[str, Any]]:
     """Get OCR tokens from either paddleocr or tesseract"""
 
+    mark_partition_ocr_used()
     ocr_layout = ocr_agent.get_layout_from_image(image=table_element_image)
     table_tokens = []
     for i, text in enumerate(ocr_layout.texts):
@@ -393,10 +401,10 @@ def merge_out_layout_with_ocr_layout(
     out_layout.texts = out_layout.texts.astype(object)
 
     for idx in invalid_text_indices:
-        out_layout.texts[idx] = aggregate_embedded_text_by_block(
+        out_layout.texts[idx], _ = aggregate_embedded_text_by_block(
             target_region=out_layout.slice([idx]),
             source_regions=ocr_layout,
-            threshold=subregion_threshold,
+            subregion_threshold=subregion_threshold,
         )
 
     final_layout = (
@@ -472,13 +480,9 @@ def supplement_layout_with_ocr_elements(
         else:
             ocr_regions_to_add = ocr_layout
     else:
-        mask = (
-            ~bboxes1_is_almost_subregion_of_bboxes2(
-                ocr_layout.element_coords, layout.element_coords, subregion_threshold
-            )
-            .sum(axis=1)
-            .astype(bool)
-        )
+        mask = ~bboxes1_is_almost_subregion_of_bboxes2(
+            ocr_layout.element_coords, layout.element_coords, subregion_threshold
+        ).sum(axis=1).astype(bool)
 
         # add ocr regions that are not covered by layout
         ocr_regions_to_add = ocr_layout.slice(mask)

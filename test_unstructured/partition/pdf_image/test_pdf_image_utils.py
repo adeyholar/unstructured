@@ -1,3 +1,5 @@
+import base64
+import io
 import os
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -5,10 +7,12 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from PIL import Image as PILImg
+from unstructured_inference.inference import pdf_image
 
 from test_unstructured.unit_utils import example_doc_path
 from unstructured.documents.coordinates import PixelSpace
 from unstructured.documents.elements import ElementMetadata, ElementType, Image, Table
+from unstructured.errors import UnprocessableEntityError
 from unstructured.partition.pdf_image import pdf_image_utils
 
 
@@ -60,12 +64,88 @@ def test_convert_pdf_to_image(file_mode, path_only):
             assert isinstance(images[0], PILImg.Image)
 
 
+def test_convert_pdf_to_image_raises_unprocessable_when_render_too_large():
+    with patch.object(
+        pdf_image_utils,
+        "render_pdf_to_image",
+        side_effect=pdf_image.PdfRenderTooLargeError("too many pixels"),
+    ):
+        with pytest.raises(UnprocessableEntityError, match="too many pixels"):
+            pdf_image_utils.convert_pdf_to_image(filename="example.pdf")
+
+
+def test_convert_pdf_to_images_raises_unprocessable_when_render_too_large():
+    with (
+        patch.object(pdf_image_utils.pdf2image, "pdfinfo_from_path", return_value={"Pages": 1}),
+        patch.object(
+            pdf_image_utils,
+            "render_pdf_to_image",
+            side_effect=pdf_image.PdfRenderTooLargeError("too many pixels"),
+        ),
+    ):
+        with pytest.raises(UnprocessableEntityError, match="too many pixels"):
+            list(pdf_image_utils.convert_pdf_to_images(filename="example.pdf"))
+
+
+@pytest.mark.parametrize("file_mode", ["filename", "rb"])
+@pytest.mark.parametrize("path_only", [True, False])
+def test_convert_pdf_to_image_twice(file_mode, path_only):
+    filename = example_doc_path("pdf/embedded-images.pdf")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        if file_mode == "filename":
+            images = pdf_image_utils.convert_pdf_to_image(
+                filename=filename,
+                file=None,
+                output_folder=tmpdir,
+                path_only=path_only,
+            )
+            images = pdf_image_utils.convert_pdf_to_image(
+                filename=filename,
+                file=None,
+                output_folder=tmpdir,
+                path_only=path_only,
+            )
+        else:
+            with open(filename, "rb") as f:
+                images = pdf_image_utils.convert_pdf_to_image(
+                    filename="",
+                    file=f,
+                    output_folder=tmpdir,
+                    path_only=path_only,
+                )
+                images = pdf_image_utils.convert_pdf_to_image(
+                    filename="",
+                    file=f,
+                    output_folder=tmpdir,
+                    path_only=path_only,
+                )
+
+        if path_only:
+            assert isinstance(images[0], str)
+        else:
+            assert isinstance(images[0], PILImg.Image)
+
+
 def test_convert_pdf_to_image_raises_error():
     filename = example_doc_path("embedded-images.pdf")
     with pytest.raises(ValueError) as exc_info:
         pdf_image_utils.convert_pdf_to_image(filename=filename, path_only=True, output_folder=None)
 
     assert str(exc_info.value) == "output_folder must be specified if path_only is true"
+
+
+def test_convert_pdf_to_image_rejects_both_filename_and_file():
+    filename = example_doc_path("pdf/embedded-images.pdf")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(filename, "rb") as f:
+            with pytest.raises(ValueError) as exc_info:
+                pdf_image_utils.convert_pdf_to_image(
+                    filename=filename,
+                    file=f,
+                    output_folder=tmpdir,
+                    path_only=True,
+                )
+    assert "Exactly one of" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -78,12 +158,21 @@ def test_convert_pdf_to_image_raises_error():
 )
 @pytest.mark.parametrize("element_category_to_save", [ElementType.IMAGE, ElementType.TABLE])
 @pytest.mark.parametrize("extract_image_block_to_payload", [False, True])
+@pytest.mark.parametrize("horizontal_padding", [0, 20])
+@pytest.mark.parametrize("vertical_padding", [0, 10])
 def test_save_elements(
     element_category_to_save,
     extract_image_block_to_payload,
     filename,
     is_image,
+    horizontal_padding,
+    vertical_padding,
+    monkeypatch,
 ):
+    if horizontal_padding > 0:
+        monkeypatch.setenv("EXTRACT_IMAGE_BLOCK_CROP_HORIZONTAL_PAD", str(horizontal_padding))
+    if vertical_padding > 0:
+        monkeypatch.setenv("EXTRACT_IMAGE_BLOCK_CROP_VERTICAL_PAD", str(vertical_padding))
     with tempfile.TemporaryDirectory() as tmpdir:
         elements = [
             Image(
@@ -136,18 +225,72 @@ def test_save_elements(
             if extract_image_block_to_payload:
                 assert isinstance(el.metadata.image_base64, str)
                 assert isinstance(el.metadata.image_mime_type, str)
+                image_bytes = base64.b64decode(el.metadata.image_base64)
+                image = PILImg.open(io.BytesIO(image_bytes))
+                x1, y1 = el.metadata.coordinates.points[0]
+                x2, y2 = el.metadata.coordinates.points[2]
+                width = x2 - x1
+                height = y2 - y1
+                assert image.width == width + 2 * horizontal_padding
+                assert image.height == height + 2 * vertical_padding
                 assert not el.metadata.image_path
                 assert not os.path.isfile(expected_image_path)
             else:
                 assert os.path.isfile(expected_image_path)
+                image = PILImg.open(expected_image_path)
+                x1, y1 = el.metadata.coordinates.points[0]
+                x2, y2 = el.metadata.coordinates.points[2]
+                width = x2 - x1
+                height = y2 - y1
+                assert image.width == width + 2 * horizontal_padding
+                assert image.height == height + 2 * vertical_padding
                 assert el.metadata.image_path == expected_image_path
                 assert not el.metadata.image_base64
                 assert not el.metadata.image_mime_type
 
 
+def test_save_elements_with_inverted_point_ordering(monkeypatch):
+    """Regression: points whose ordering puts points[0] below points[2] (as happens when
+    coordinates come from / were converted from a y-up CARTESIAN system) must not raise
+    PIL's "Coordinate 'lower' is less than 'upper'" ValueError."""
+    filename = example_doc_path("img/layout-parser-paper-fast.jpg")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # points[0] is the bottom-left (larger y) and points[2] the top-right (smaller y),
+        # i.e. the reverse of the usual ((x1,y1),(x1,y2),(x2,y2),(x2,y1)) screen ordering.
+        element = Image(
+            text="Inverted Image",
+            coordinates=((78, 519), (78, 86), (512, 86), (512, 519)),
+            coordinate_system=PixelSpace(width=1575, height=1166),
+            metadata=ElementMetadata(page_number=1),
+        )
+
+        pdf_image_utils.save_elements(
+            elements=[element],
+            starting_page_number=1,
+            element_category_to_save=ElementType.IMAGE,
+            pdf_image_dpi=200,
+            filename=filename,
+            is_image=True,
+            output_dir_path=str(tmpdir),
+        )
+
+        expected_image_path = os.path.join(str(tmpdir), "figure-1-1.jpg")
+        assert os.path.isfile(expected_image_path)
+        assert element.metadata.image_path == expected_image_path
+        # The crop box is taken from the extent of all points regardless of their order.
+        image = PILImg.open(expected_image_path)
+        assert image.width == 512 - 78
+        assert image.height == 519 - 86
+
+
 @pytest.mark.parametrize("storage_enabled", [False, True])
-def test_save_elements_with_output_dir_path_none(monkeypatch, storage_enabled):
-    monkeypatch.setenv("GLOBAL_WORKING_DIR_ENABLED", storage_enabled)
+def test_save_elements_with_output_dir_path_none(
+    monkeypatch, storage_enabled, isolated_global_working_dir
+):
+    monkeypatch.setenv(
+        "GLOBAL_WORKING_DIR_ENABLED",
+        "true" if storage_enabled else "false",
+    )
     with (
         patch("PIL.Image.open"),
         patch("unstructured.partition.pdf_image.pdf_image_utils.write_image"),

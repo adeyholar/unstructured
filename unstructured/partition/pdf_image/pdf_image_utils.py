@@ -14,8 +14,11 @@ import cv2
 import numpy as np
 import pdf2image
 from PIL import Image
+from unstructured_inference.inference.layout import convert_pdf_to_image as render_pdf_to_image
+from unstructured_inference.inference.pdf_image import PdfRenderTooLargeError
 
 from unstructured.documents.elements import ElementType
+from unstructured.errors import UnprocessableEntityError
 from unstructured.logger import logger
 from unstructured.partition.common.common import convert_to_bytes, exactly_one
 from unstructured.partition.utils.config import env_config
@@ -55,34 +58,28 @@ def write_image(image: Union[Image.Image, np.ndarray], output_image_path: str):
 def convert_pdf_to_image(
     filename: str,
     file: Optional[Union[bytes, BinaryIO]] = None,
-    dpi: int = 200,
+    dpi: Optional[int] = None,
     output_folder: Optional[Union[str, PurePath]] = None,
     path_only: bool = False,
     password: Optional[str] = None,
 ) -> Union[List[Image.Image], List[str]]:
-    """Get the image renderings of the pdf pages using pdf2image"""
+    exactly_one(filename=filename, file=file)
 
-    if path_only and not output_folder:
-        raise ValueError("output_folder must be specified if path_only is true")
+    if dpi is None:
+        dpi = env_config.PDF_RENDER_DPI
 
-    if file is not None:
-        f_bytes = convert_to_bytes(file)
-        images = pdf2image.convert_from_bytes(
-            f_bytes,
+    try:
+        return render_pdf_to_image(
+            filename=filename,
+            file=file,
             dpi=dpi,
             output_folder=output_folder,
-            paths_only=path_only,
-            userpw=password,
+            path_only=path_only,
+            password=password,
+            pdf_render_max_pixels_per_page=env_config.PDF_RENDER_MAX_PIXELS_PER_PAGE,
         )
-    else:
-        images = pdf2image.convert_from_path(
-            filename,
-            dpi=dpi,
-            output_folder=output_folder,
-            paths_only=path_only,
-        )
-
-    return images
+    except PdfRenderTooLargeError as exc:
+        raise UnprocessableEntityError(str(exc)) from exc
 
 
 def pad_element_bboxes(
@@ -184,8 +181,15 @@ def save_elements(
                 continue
 
             points = coordinates.points
-            x1, y1 = points[0]
-            x2, y2 = points[2]
+            # Don't assume a fixed corner ordering: depending on the element's
+            # coordinate-system orientation, points[0]/points[2] are not reliably the
+            # top-left/bottom-right in the page image's screen space. Trusting them can
+            # yield an inverted PIL crop box and raise "Coordinate 'lower' is less than
+            # 'upper'". Take the extent of all points instead.
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            x1, y1 = min(xs), min(ys)
+            x2, y2 = max(xs), max(ys)
             h_padding = env_config.EXTRACT_IMAGE_BLOCK_CROP_HORIZONTAL_PAD
             v_padding = env_config.EXTRACT_IMAGE_BLOCK_CROP_VERTICAL_PAD
             padded_bbox = cast(
@@ -360,11 +364,11 @@ def annotate_layout_elements(
                 )
         else:
             with tempfile.TemporaryDirectory() as temp_dir:
-                _image_paths = pdf2image.convert_from_path(
+                _image_paths = convert_pdf_to_image(
                     filename,
                     dpi=pdf_image_dpi,
                     output_folder=temp_dir,
-                    paths_only=True,
+                    path_only=True,
                 )
                 image_paths = cast(List[str], _image_paths)
                 for i, image_path in enumerate(image_paths):
@@ -414,20 +418,19 @@ def convert_pdf_to_images(
     total_pages = info["Pages"]
     for start_page in range(1, total_pages + 1, chunk_size):
         end_page = min(start_page + chunk_size - 1, total_pages)
-        if f_bytes is not None:
-            chunk_images = pdf2image.convert_from_bytes(
-                f_bytes,
+        try:
+            chunk_images = render_pdf_to_image(
+                filename=filename if f_bytes is None else None,
+                file=f_bytes,
+                dpi=env_config.PDF_RENDER_DPI,
                 first_page=start_page,
                 last_page=end_page,
-                userpw=password,
+                password=password,
+                pdf_render_max_pixels_per_page=env_config.PDF_RENDER_MAX_PIXELS_PER_PAGE,
             )
-        else:
-            chunk_images = pdf2image.convert_from_path(
-                filename,
-                first_page=start_page,
-                last_page=end_page,
-                userpw=password,
-            )
+        except PdfRenderTooLargeError as exc:
+            raise UnprocessableEntityError(str(exc)) from exc
+        chunk_images = cast(List[Image.Image], chunk_images)
 
         for image in chunk_images:
             yield image

@@ -4,11 +4,13 @@ import os
 import pathlib
 import platform
 import tempfile
+import zlib
+from unittest.mock import mock_open, patch
 
 import pandas as pd
 import pytest
 
-from test_unstructured.unit_utils import assign_hash_ids
+from test_unstructured.unit_utils import assign_hash_ids, input_path
 from unstructured.documents.elements import (
     Address,
     CheckBox,
@@ -19,15 +21,19 @@ from unstructured.documents.elements import (
     ElementMetadata,
     ElementType,
     FigureCaption,
+    Form,
+    Formula,
     Image,
     Link,
     ListItem,
     NarrativeText,
     PageBreak,
     Table,
+    TableChunk,
     Text,
     Title,
 )
+from unstructured.errors import DecompressedSizeExceededError
 from unstructured.partition.email import partition_email
 from unstructured.partition.text import partition_text
 from unstructured.staging import base
@@ -45,15 +51,42 @@ def test_base64_gzipped_json_to_elements_can_deserialize_compressed_elements_fro
     assert elements == [Title("Lorem"), Text("Lorem Ipsum")]
 
 
+def test_elements_from_base64_gzipped_json_raises_error_if_decompression_is_incomplete():
+    base64_elements_str = (
+        "eJyFzcsKwjAQheFXKVm7yDS3xjcQXNaViKTJjBR6o46glr67zVI3Lmf4Dv95EdhhjwNf2yT2hYDGUaWtJVm5WDoq"
+        "NUL0UoJrqtLHJHaF6JFDChw2v6zbzfjkvD2OM/YZ8GvC/Khb7lBs5LcilUwRyCsblQYTiBQpZRxYZcCA/1spDtP9"
+        "8dU6DTEw3sa5fWOqs10vH0cL="
+    )
+
+    with pytest.raises(zlib.error):
+        base.elements_from_base64_gzipped_json(base64_elements_str)
+
+
+def test_elements_from_base64_gzipped_json_raises_error_if_decompression_exceeds_max_size():
+    base64_elements_str = (
+        "eJyFzcsKwjAQheFXKVm7yDS3xjcQXNaViKTJjBR6o46glr67zVI3Lmf4Dv95EdhhjwNf2yT2hYDGUaWtJVm5WDoq"
+        "NUL0UoJrqtLHJHaF6JFDChw2v6zbzfjkvD2OM/YZ8GvC/Khb7lBs5LcilUwRyCsblQYTiBQpZRxYZcCA/1spDtP9"
+        "8dU6DTEw3sa5fWOqs10vH0cLQn0="
+    )
+
+    with (
+        patch("unstructured.staging.base.MAX_DECOMPRESSED_SIZE", 32),
+        pytest.raises(DecompressedSizeExceededError),
+    ):
+        base.elements_from_base64_gzipped_json(base64_elements_str)
+
+
 def test_elements_to_base64_gzipped_json_can_serialize_elements_to_a_base64_str():
     elements = assign_hash_ids([Title("Lorem"), Text("Lorem Ipsum")])
 
-    assert base.elements_to_base64_gzipped_json(elements) == (
-        "eJyFzcsKwjAQheFXKVm7MGkzbXwDocu6EpFcTqTQG3UEtfTdbZa"
-        "6cTnDd/jPi0CHHgNf2yAOmXCljjqXoErKoIw3hqJRXlPuyphrEr"
-        "tM9GAbLNvNL+t2M56ctvU4o0+AXxPSo2m5g9jIb6VwBE0VBSujp1"
-        "LJ6EiRLpwiSBf3fyvZcbo/vlqnwVvGbZzbN0KT7Hr5AG/eQyM="
-    )
+    b64_str = base.elements_to_base64_gzipped_json(elements)
+
+    # Verify round-trip: decompress and check the JSON content rather than the
+    # exact compressed bytes, which vary across zlib implementations (e.g. zlib-ng).
+    round_tripped = base.elements_from_base64_gzipped_json(b64_str)
+    assert len(round_tripped) == 2
+    assert round_tripped[0].text == "Lorem"
+    assert round_tripped[1].text == "Lorem Ipsum"
 
 
 def test_elements_to_dicts():
@@ -83,6 +116,16 @@ def test_elements_from_dicts():
         ListItem(text="Blurb3"),
         ListItem(text="Blurb4"),
     ]
+
+
+def test_elements_from_dicts_form():
+    element_dicts = [
+        {"text": "Applicant Name: Jane Doe", "type": "Form"},
+    ]
+
+    elements = base.elements_from_dicts(element_dicts)
+
+    assert elements == [Form(text="Applicant Name: Jane Doe")]
 
 
 def test_convert_to_csv(tmp_path: str):
@@ -210,6 +253,7 @@ def test_all_elements_preserved_when_serialized():
         ListItem(text="list", metadata=metadata, element_id="6"),
         Image(text="image", metadata=metadata, element_id="7"),
         Text(text="text", metadata=metadata, element_id="8"),
+        TableChunk(text="table chunk", metadata=metadata, element_id="9"),
         PageBreak(text=""),
     ]
 
@@ -229,6 +273,7 @@ def test_serialized_deserialize_elements_to_json(tmpdir: str):
         ListItem(text="list", metadata=metadata, element_id="6"),
         Image(text="image", metadata=metadata, element_id="7"),
         Text(text="text", metadata=metadata, element_id="8"),
+        TableChunk(text="table chunk", metadata=metadata, element_id="9"),
         PageBreak(text=""),
     ]
 
@@ -551,6 +596,7 @@ def test_elements_to_md_conversion(json_filename: str, expected_md_filename: str
     [
         (Title("Test Title"), "# Test Title", False),
         (NarrativeText("This is some narrative text."), "This is some narrative text.", False),
+        (Formula(r"\int_a^b x^2 dx"), "$$\n\\int_a^b x^2 dx\n$$", False),
         (
             Image(
                 "Test Image",
@@ -608,6 +654,184 @@ def test_element_to_md_conversion(element: "Element", expected_markdown: str, ex
     )
 
 
+def test_element_to_md_formula_normalizes_common_math_symbols():
+    element = Formula("x ∈ A and y ≤ z and a × b = c")
+    assert base.element_to_md(element) == (
+        "$$\nx \\in{} A and y \\leq{} z and a \\times{} b = c\n$$"
+    )
+
+
+def test_element_to_md_formula_can_disable_normalization():
+    element = Formula("x ∈ A and y ≤ z and a × b = c")
+    assert (
+        base.element_to_md(element, normalize_formula=False)
+        == "$$\nx ∈ A and y ≤ z and a × b = c\n$$"
+    )
+
+
+def test_element_to_md_formula_preserves_unicode_square_root():
+    """√ must not become \\sqrt{} (would break √2, √(x+1), etc.)."""
+    assert base.element_to_md(Formula("√2")) == "$$\n√2\n$$"
+    assert base.element_to_md(Formula("√(x+1)")) == "$$\n√(x+1)\n$$"
+    assert base.element_to_md(Formula("√2 ≤ x")) == "$$\n√2 \\leq{} x\n$$"
+
+
+def test_elements_to_md_positional_encoding_backward_compat():
+    """Legacy positional (... filename, exclude_binary_image_data, encoding) must still work."""
+    m = mock_open()
+    with patch("builtins.open", m):
+        base.elements_to_md([Title("x")], "out.md", False, "latin-1")
+    assert m.call_count == 1
+    _args, kwargs = m.call_args
+    assert kwargs.get("encoding") == "latin-1"
+
+
+def test_create_file_from_elements_positional_no_group_by_page_backward_compat():
+    """Legacy HTML positional args through no_group_by_page still bind correctly."""
+    with patch("unstructured.partition.html.convert.elements_to_html") as mock_html:
+        mock_html.return_value = "<html></html>"
+        base.create_file_from_elements([Title("P")], "html", None, "utf-8", False, False)
+    mock_html.assert_called_once()
+    assert mock_html.call_args.kwargs["exclude_binary_image_data"] is False
+    assert mock_html.call_args.kwargs["no_group_by_page"] is False
+
+
+def test_elements_to_md_formula_can_disable_normalization():
+    elements = [Formula("x ∈ A")]
+    assert base.elements_to_md(elements, normalize_formula=False) == "$$\nx ∈ A\n$$"
+
+
+def test_create_file_from_elements_markdown_passes_formula_normalization_flag():
+    elements = [Formula("x ∈ A")]
+    content = base.create_file_from_elements(
+        elements,
+        output_format="markdown",
+        normalize_formula=False,
+    )
+    assert content == "$$\nx ∈ A\n$$"
+
+
+def test_element_to_md_formula_auto_plain_for_noisy_ocr():
+    text = "_ CRo-CR O= OR"
+    assert base.element_to_md(Formula(text)) == text
+
+
+def test_element_to_md_formula_auto_plain_when_embedded_dollar_delimiters():
+    assert base.element_to_md(Formula("a $$ b")) == "a $$ b"
+    assert base.element_to_md(Formula("inline $x$ math")) == "inline $x$ math"
+
+
+def test_element_to_md_formula_display_math_fallback_when_unsafe_delimiters():
+    raw = "a $$ b"
+    assert (
+        base.element_to_md(
+            Formula(raw),
+            formula_markdown_style=base.FORMULA_MARKDOWN_DISPLAY_MATH,
+        )
+        == raw
+    )
+
+
+def test_element_to_md_formula_display_math_wraps_when_auto_would_plain():
+    assert base.element_to_md(Formula("x = 1")) == "x = 1"
+    assert (
+        base.element_to_md(
+            Formula("x = 1"),
+            formula_markdown_style=base.FORMULA_MARKDOWN_DISPLAY_MATH,
+        )
+        == "$$\nx = 1\n$$"
+    )
+
+
+def test_element_to_md_formula_auto_plain_for_prose_style_caption():
+    text = (
+        "The corrosion rate (CR) was calculated using Eq. (1) "
+        "and we reference [1–5] for detail in this manuscript."
+    )
+    assert base.element_to_md(Formula(text)) == text
+
+
+def test_element_to_md_formula_invalid_style_raises():
+    with pytest.raises(ValueError, match="formula_markdown_style"):
+        base.element_to_md(Formula("x=1"), formula_markdown_style="nope")
+
+
+def test_elements_to_md_formula_markdown_style_keyword_only():
+    els = [Formula("x ∈ A")]
+    out = base.elements_to_md(els, formula_markdown_style=base.FORMULA_MARKDOWN_PLAIN)
+    assert out == "x ∈ A"
+    out_plain_unicode = base.elements_to_md(
+        els,
+        normalize_formula=False,
+        formula_markdown_style=base.FORMULA_MARKDOWN_PLAIN,
+    )
+    assert out_plain_unicode == "x ∈ A"
+
+
+def test_element_to_md_formula_plain_never_normalizes_unicode_minus():
+    assert (
+        base.element_to_md(
+            Formula("a − b"),
+            formula_markdown_style=base.FORMULA_MARKDOWN_PLAIN,
+        )
+        == "a − b"
+    )
+
+
+def test_element_to_md_formula_in_brace_boundary_after_symbol():
+    out = base.element_to_md(
+        Formula("x∈S"),
+        formula_markdown_style=base.FORMULA_MARKDOWN_DISPLAY_MATH,
+    )
+    assert out == "$$\nx\\in{}S\n$$"
+
+
+def test_formula_auto_scores_raw_text_prose_with_one_symbol_stays_plain():
+    text = (
+        "E ≤ threshold where E is the energy and threshold was determined experimentally "
+        "in the laboratory setup described above herein."
+    )
+    assert base.element_to_md(Formula(text)) == text
+
+
+def test_elements_from_json_to_md_with_formula_fixture():
+    """JSON fixture → elements_from_json → elements_to_md (real Formula types)."""
+    path = input_path("staging/formula-elements.json")
+    elements = base.elements_from_json(filename=path)
+    assert len(elements) == 2
+    assert elements[0].category == "NarrativeText"
+    assert elements[1].category == "Formula"
+    md = base.elements_to_md(elements)
+    assert md == "See equation below.\n$$\nE = mc^2\n$$"
+
+
+def test_elements_to_md_five_positional_args_order():
+    """Lock (elements, filename, exclude_binary_image_data, encoding, normalize_formula)."""
+    m = mock_open()
+    elements = [Formula("x ∈ A")]
+    with patch("builtins.open", m):
+        out = base.elements_to_md(elements, "out.md", False, "latin-1", False)
+    assert out == "$$\nx ∈ A\n$$"
+    assert m.call_args.kwargs.get("encoding") == "latin-1"
+
+
+def test_create_file_from_elements_propagates_formula_markdown_style():
+    elements = [Formula("x = 1")]
+    assert base.create_file_from_elements(elements, output_format="markdown") == "x = 1"
+    dm = base.create_file_from_elements(
+        elements,
+        output_format="markdown",
+        formula_markdown_style=base.FORMULA_MARKDOWN_DISPLAY_MATH,
+    )
+    assert dm == "$$\nx = 1\n$$"
+    plain = base.create_file_from_elements(
+        elements,
+        output_format="markdown",
+        formula_markdown_style=base.FORMULA_MARKDOWN_PLAIN,
+    )
+    assert plain == "x = 1"
+
+
 def test_elements_to_md_file_output():
     """Test elements_to_md function with file output."""
 
@@ -634,6 +858,141 @@ def test_elements_to_md_file_output():
             os.unlink(tmp_filename)
 
 
+def test_create_file_from_elements_markdown():
+    """Test create_file_from_elements with format=markdown returns and optionally writes file."""
+    elements = [Title("Heading"), NarrativeText("Some body text.")]
+    content = base.create_file_from_elements(elements, output_format="markdown")
+    assert content == "# Heading\nSome body text."
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp_file:
+        tmp_filename = tmp_file.name
+    try:
+        out = base.create_file_from_elements(
+            elements, output_format="markdown", filename=tmp_filename
+        )
+        assert out == content
+        with open(tmp_filename) as f:
+            assert f.read() == content
+    finally:
+        if os.path.exists(tmp_filename):
+            os.unlink(tmp_filename)
+
+
+def test_create_file_from_elements_text():
+    """Test create_file_from_elements with format=text."""
+    elements = [Title("A"), NarrativeText("B")]
+    content = base.create_file_from_elements(elements, output_format="text")
+    assert content == "A\nB"
+
+
+def test_create_file_from_elements_html():
+    """Test create_file_from_elements with format=html returns HTML."""
+    elements = [Title("Page"), NarrativeText("Content")]
+    content = base.create_file_from_elements(elements, output_format="html")
+    assert "<!DOCTYPE html" in content
+    assert "<body>" in content
+    assert "Page" in content
+    assert "Content" in content
+
+
+def test_create_file_from_elements_unsupported_format():
+    """Test create_file_from_elements raises for unsupported format."""
+    elements = [Title("X")]
+    with pytest.raises(ValueError, match="Unsupported format"):
+        base.create_file_from_elements(elements, output_format="pdf")
+
+
+def test_create_file_from_elements_html_group_by_page_drops_elements_without_page_number():
+    """With no_group_by_page=False, elements without page_number are skipped (body empty)."""
+    elements = [Title("Page"), NarrativeText("Content")]
+    content = base.create_file_from_elements(elements, output_format="html", no_group_by_page=False)
+    assert "<!DOCTYPE html" in content
+    assert "<body>" in content
+    # Elements without metadata.page_number are not included when grouping by page
+    assert "Page" not in content
+    assert "Content" not in content
+
+
+@pytest.mark.parametrize(
+    ("format_name", "expected_in_content"),
+    [
+        ("markdown", "# Heading\nSome body text."),
+        ("text", "Heading\nSome body text."),
+        ("html", "<!DOCTYPE html"),
+    ],
+)
+def test_create_file_from_elements_filename_write(format_name: str, expected_in_content: str):
+    """Test create_file_from_elements writes correct content to file for all formats."""
+    elements = [Title("Heading"), NarrativeText("Some body text.")]
+    ext = {"markdown": ".md", "text": ".txt", "html": ".html"}[format_name]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=ext, delete=False) as tmp_file:
+        tmp_filename = tmp_file.name
+    try:
+        out = base.create_file_from_elements(
+            elements, output_format=format_name, filename=tmp_filename
+        )
+        assert expected_in_content in out
+        with open(tmp_filename) as f:
+            written = f.read()
+        assert expected_in_content in written
+        assert out == written
+    finally:
+        if os.path.exists(tmp_filename):
+            os.unlink(tmp_filename)
+
+
+def test_create_file_from_elements_exclude_binary_image_data_markdown():
+    """exclude_binary_image_data=True passthrough: markdown omits base64 image data."""
+    elements = [
+        Title("Doc"),
+        Image(
+            "Alt",
+            metadata=ElementMetadata(
+                image_base64="abc123",
+                image_mime_type="image/png",
+            ),
+        ),
+    ]
+    content = base.create_file_from_elements(
+        elements, output_format="markdown", exclude_binary_image_data=True
+    )
+    assert "base64," not in content
+    assert "Alt" in content
+
+
+def test_create_file_from_elements_exclude_binary_image_data_html():
+    """exclude_binary_image_data=True passthrough: HTML omits base64 image data."""
+    elements = [
+        Title("Doc"),
+        Image(
+            "Alt",
+            metadata=ElementMetadata(
+                image_base64="abc123",
+                image_mime_type="image/png",
+            ),
+        ),
+    ]
+    content = base.create_file_from_elements(
+        elements, output_format="html", exclude_binary_image_data=True
+    )
+    assert "abc123" not in content
+
+
+@pytest.mark.parametrize(
+    ("format_arg", "expected_substring"),
+    [
+        (" Markdown ", "# Heading"),
+        ("HTML ", "<!DOCTYPE html"),
+        (" TEXT ", "Heading"),
+    ],
+)
+def test_create_file_from_elements_format_normalization(format_arg: str, expected_substring: str):
+    """Format string is stripped and lowercased (e.g. ' Markdown ' -> 'markdown')."""
+    elements = [Title("Heading"), NarrativeText("Body")]
+    content = base.create_file_from_elements(elements, output_format=format_arg)
+    assert expected_substring in content
+
+
 def test_element_to_md_with_none_mime_type():
     """Test element_to_md handles None mime_type gracefully."""
     from unstructured.documents.elements import ElementMetadata, Image
@@ -652,3 +1011,72 @@ def test_element_to_md_with_none_mime_type():
     result = base.element_to_md(image_element)
     assert "![Test Image](data:image/*" in result
     assert "base64," in result
+
+
+def test_fix_metadata_field_precision_leaves_elements_with_nothing_to_round_alone():
+    """Copying an element to round fields it does not have is waste.
+
+    Both `elements_to_json()` and `orig_elements` serialization run this over every element, so the
+    copy was paid on every element of every document, not only the ones carrying coordinates.
+    """
+    element = Text("Lorem Ipsum")
+    assert element.metadata.coordinates is None
+    assert element.metadata.detection_class_prob is None
+
+    (result,) = base._fix_metadata_field_precision([element])
+
+    assert result is element
+
+
+def test_fix_metadata_field_precision_rounds_a_copy_and_leaves_the_callers_element_unrounded():
+    element = Text(
+        "Lorem",
+        metadata=ElementMetadata(
+            coordinates=CoordinatesMetadata(
+                points=((1.23456, 2.34567), (3.45678, 4.56789)),
+                system=CoordinateSystem(width=10, height=10),
+            ),
+            detection_class_prob=0.123456789,
+        ),
+    )
+
+    (result,) = base._fix_metadata_field_precision([element])
+
+    assert result.metadata.coordinates.points == ((1.23, 2.35), (3.46, 4.57))
+    assert result.metadata.detection_class_prob == 0.12346
+    assert element.metadata.coordinates.points == ((1.23456, 2.34567), (3.45678, 4.56789))
+    assert element.metadata.detection_class_prob == 0.123456789
+
+
+@pytest.mark.parametrize(
+    "rounded_field",
+    [
+        {
+            "coordinates": CoordinatesMetadata(
+                points=((1.23456, 2.34567), (3.45678, 4.56789)),
+                system=CoordinateSystem(width=10, height=10),
+            )
+        },
+        {"detection_class_prob": 0.123456789},
+    ],
+    ids=["coordinates", "detection_class_prob"],
+)
+def test_elements_to_json_keeps_orig_elements_ids_stable_for_an_element_it_rounds(rounded_field):
+    """Rounding a parent's precision must not re-mint the ids of the elements it carries.
+
+    `Element.id` caches on first access, so copying the parent's `orig_elements` subtree gave the
+    nested elements a fresh uuid on every call.
+    """
+    child = Text("Ipsum")
+    parent = Text("Lorem", metadata=ElementMetadata(orig_elements=[child], **rounded_field))
+
+    first = json.loads(base.elements_to_json([parent]))
+    second = json.loads(base.elements_to_json([parent]))
+
+    first_ids = [
+        e.id for e in base.elements_from_base64_gzipped_json(first[0]["metadata"]["orig_elements"])
+    ]
+    second_ids = [
+        e.id for e in base.elements_from_base64_gzipped_json(second[0]["metadata"]["orig_elements"])
+    ]
+    assert first_ids == second_ids == [child.id]

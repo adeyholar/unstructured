@@ -9,6 +9,7 @@ import hashlib
 import os
 import pathlib
 import uuid
+from functools import cached_property
 from itertools import groupby
 from types import MappingProxyType
 from typing import Any, Callable, FrozenSet, Optional, Sequence, cast
@@ -21,7 +22,7 @@ from unstructured.documents.coordinates import (
     RelativeCoordinateSystem,
 )
 from unstructured.partition.utils.constants import UNSTRUCTURED_INCLUDE_DEBUG_METADATA
-from unstructured.utils import get_call_args_applying_defaults, lazyproperty
+from unstructured.utils import get_call_args_applying_defaults
 
 Point: TypeAlias = "tuple[float, float]"
 Points: TypeAlias = "tuple[Point, ...]"
@@ -158,6 +159,8 @@ class ElementMetadata:
     #   to consolidate this new metadata field from each pre-chunk element during chunking.
     # - Add field-name to DEBUG_FIELD_NAMES if it shouldn't appear in dict/JSON or participate in
     #   equality comparison.
+    # - Add field-name to SEPARATELY_SERIALIZED_FIELD_NAMES if `.to_dict()` replaces its value
+    #   with a serialized form, so it is not deep-copied first.
 
     attached_to_filename: Optional[str]
     category_depth: Optional[int]
@@ -167,6 +170,11 @@ class ElementMetadata:
     detection_class_prob: Optional[float]
     # -- DEBUG field, the detection mechanism that emitted this element --
     detection_origin: Optional[str]
+    # -- per-attribute model provenance for enrichments. Maps a written attribute name (e.g.
+    # -- "text", "text_as_html", "embeddings") to a list of records in application order, each
+    # -- {"type", "provider", "model"}. Authoring enrichments overwrite (reset the list);
+    # -- additive enrichments append (preserving the prior author). --
+    enrichment_origins: Optional[dict[str, list[dict[str, str]]]]
     emphasized_text_contents: Optional[list[str]]
     emphasized_text_tags: Optional[list[str]]
     file_directory: Optional[str]
@@ -195,6 +203,10 @@ class ElementMetadata:
     page_number: Optional[int]
     parent_id: Optional[str]
 
+    # -- routing decision (page-level) --
+    routing: Optional[str]
+    routing_score: Optional[float]
+
     # -- e-mail specific metadata fields --
     bcc_recipient: Optional[list[str]]
     cc_recipient: Optional[list[str]]
@@ -206,13 +218,31 @@ class ElementMetadata:
 
     # -- used for Table elements to capture rows/col structure --
     text_as_html: Optional[str]
+    is_extracted: Optional[str]
     table_as_cells: Optional[dict[str, str | int]]
+    table_extraction_method: Optional[str]  # "grid", "tatr", or "vlm"
+
+    # -- used for TableChunk elements to enable table reconstruction --
+    table_id: Optional[str]
+    chunk_index: Optional[int]
+    num_carried_over_header_rows: Optional[int]
     url: Optional[str]
+
+    # -- speech-to-text segment timestamps (seconds) when element is from partition_audio --
+    segment_end_seconds: Optional[float]
+    segment_start_seconds: Optional[float]
 
     # -- debug fields can be assigned and referenced using dotted-notation but are not serialized
     # -- to dict/JSON, do not participate in equality comparison, and are not included in the
     # -- `.fields` dict used by other parts of the library like chunking and weaviate.
     DEBUG_FIELD_NAMES = frozenset(["detection_origin"])
+
+    #: Fields that `.to_dict()` replaces with their serialized form. Deep-copying them there
+    #: would only build a copy that is thrown away on the next few lines, and `orig_elements` on
+    #: a chunk holds every source element of that chunk.
+    SEPARATELY_SERIALIZED_FIELD_NAMES = frozenset(
+        ["coordinates", "data_source", "orig_elements", "key_value_pairs"]
+    )
 
     def __init__(
         self,
@@ -223,6 +253,7 @@ class ElementMetadata:
         coordinates: Optional[CoordinatesMetadata] = None,
         data_source: Optional[DataSourceMetadata] = None,
         detection_class_prob: Optional[float] = None,
+        enrichment_origins: Optional[dict[str, list[dict[str, str]]]] = None,
         emphasized_text_contents: Optional[list[str]] = None,
         emphasized_text_tags: Optional[list[str]] = None,
         file_directory: Optional[str] = None,
@@ -245,13 +276,21 @@ class ElementMetadata:
         page_name: Optional[str] = None,
         page_number: Optional[int] = None,
         parent_id: Optional[str] = None,
+        routing: Optional[str] = None,
+        routing_score: Optional[float] = None,
         sent_from: Optional[list[str]] = None,
         sent_to: Optional[list[str]] = None,
         signature: Optional[str] = None,
         subject: Optional[str] = None,
         table_as_cells: Optional[dict[str, str | int]] = None,
+        table_extraction_method: Optional[str] = None,
+        table_id: Optional[str] = None,
+        chunk_index: Optional[int] = None,
+        num_carried_over_header_rows: Optional[int] = None,
         text_as_html: Optional[str] = None,
         url: Optional[str] = None,
+        segment_end_seconds: Optional[float] = None,
+        segment_start_seconds: Optional[float] = None,
     ) -> None:
         self.attached_to_filename = attached_to_filename
         self.bcc_recipient = bcc_recipient
@@ -260,6 +299,7 @@ class ElementMetadata:
         self.coordinates = coordinates
         self.data_source = data_source
         self.detection_class_prob = detection_class_prob
+        self.enrichment_origins = enrichment_origins
         self.emphasized_text_contents = emphasized_text_contents
         self.emphasized_text_tags = emphasized_text_tags
 
@@ -290,13 +330,21 @@ class ElementMetadata:
         self.page_name = page_name
         self.page_number = page_number
         self.parent_id = parent_id
+        self.routing = routing
+        self.routing_score = routing_score
         self.sent_from = sent_from
         self.sent_to = sent_to
         self.signature = signature
         self.subject = subject
         self.text_as_html = text_as_html
         self.table_as_cells = table_as_cells
+        self.table_extraction_method = table_extraction_method
+        self.table_id = table_id
+        self.chunk_index = chunk_index
+        self.num_carried_over_header_rows = num_carried_over_header_rows
         self.url = url
+        self.segment_end_seconds = segment_end_seconds
+        self.segment_start_seconds = segment_start_seconds
 
     def __eq__(self, other: object) -> bool:
         """Implments equivalence, like meta == other_meta.
@@ -390,7 +438,14 @@ class ElementMetadata:
         """
         from unstructured.staging.base import elements_to_base64_gzipped_json
 
-        meta_dict = copy.deepcopy(dict(self.fields))
+        # -- copy the fields a caller could mutate to reach back into this metadata, but not the
+        # -- ones replaced by their serialized form below. Those stay in place as placeholders so
+        # -- the reassignments keep their original key position --
+        fields = self.fields
+        copied = copy.deepcopy(
+            {k: v for k, v in fields.items() if k not in self.SEPARATELY_SERIALIZED_FIELD_NAMES}
+        )
+        meta_dict = {k: copied.get(k, v) for k, v in fields.items()}
 
         # -- remove fields that should not be serialized --
         for field_name in self.DEBUG_FIELD_NAMES:
@@ -435,7 +490,7 @@ class ElementMetadata:
         for field_name, field_value in other.fields.items():
             setattr(self, field_name, field_value)
 
-    @lazyproperty
+    @cached_property
     def _known_field_names(self) -> FrozenSet[str]:
         """field-names for non-user-defined fields, available on all ElementMetadata instances.
 
@@ -470,6 +525,11 @@ class ConsolidationStrategy(enum.Enum):
     LIST_UNIQUE = "list_unique"
     """Union list values across elements, preserving order. Only suitable for `List` fields."""
 
+    DICT_LIST_UNIQUE = "dict_list_unique"
+    """Merge dict-of-list values across elements: union keys, and per key concatenate the lists
+    then drop duplicate records, preserving first-seen order. Suitable for `dict[str, list]`
+    fields like `enrichment_origins`."""
+
     @classmethod
     def field_consolidation_strategies(cls) -> dict[str, ConsolidationStrategy]:
         """Mapping from ElementMetadata field-name to its consolidation strategy.
@@ -487,6 +547,7 @@ class ConsolidationStrategy(enum.Enum):
             "data_source": cls.FIRST,
             "detection_class_prob": cls.DROP,
             "detection_origin": cls.DROP,
+            "enrichment_origins": cls.DICT_LIST_UNIQUE,
             "emphasized_text_contents": cls.LIST_CONCATENATE,
             "emphasized_text_tags": cls.LIST_CONCATENATE,
             "file_directory": cls.FIRST,
@@ -498,6 +559,7 @@ class ConsolidationStrategy(enum.Enum):
             "image_base64": cls.DROP,
             "image_mime_type": cls.DROP,
             "is_continuation": cls.DROP,  # -- not expected, added by chunking, not before --
+            "is_extracted": cls.DROP,
             "languages": cls.LIST_UNIQUE,
             "last_modified": cls.FIRST,
             "link_texts": cls.LIST_CONCATENATE,
@@ -510,13 +572,25 @@ class ConsolidationStrategy(enum.Enum):
             "page_name": cls.FIRST,
             "page_number": cls.FIRST,
             "parent_id": cls.DROP,
+            "routing": cls.DROP,
+            "routing_score": cls.DROP,
             "sent_from": cls.FIRST,
             "sent_to": cls.FIRST,
             "signature": cls.FIRST,
             "subject": cls.FIRST,
             "text_as_html": cls.STRING_CONCATENATE,
             "table_as_cells": cls.FIRST,  # -- only occurs in Table --
+            "table_extraction_method": cls.FIRST,
+            "table_id": cls.DROP,  # -- added by chunking, not before --
+            "chunk_index": cls.DROP,  # -- added by chunking, not before --
+            "num_carried_over_header_rows": cls.DROP,  # -- added by chunking, not before --
             "url": cls.FIRST,
+            # TODO: ideally a chunk spanning multiple audio segments would keep min(start) and
+            # max(end) across its constituent elements. ConsolidationStrategy currently has no
+            # MIN/MAX variants, so DROP is the safe fallback for now. Add MIN/MAX strategies
+            # and switch these to cls.MIN / cls.MAX when that work is done.
+            "segment_start_seconds": cls.DROP,
+            "segment_end_seconds": cls.DROP,
             "key_value_pairs": cls.DROP,  # -- only occurs in FormKeysValues --
         }
 
@@ -898,6 +972,12 @@ class NarrativeText(Text):
     category = "NarrativeText"
 
 
+class Form(Text):
+    """An element for capturing form text."""
+
+    category = "Form"
+
+
 class ListItem(Text):
     """ListItem is a NarrativeText element that is part of a list."""
 
@@ -998,7 +1078,7 @@ TYPE_TO_TEXT_ELEMENT_MAP: dict[str, type[Text]] = {
     # this mapping favors ensures yolox produces backward compatible categories
     ElementType.ABSTRACT: NarrativeText,
     ElementType.THREADING: NarrativeText,
-    ElementType.FORM: NarrativeText,
+    ElementType.FORM: Form,
     ElementType.VALUE: NarrativeText,
     ElementType.LINK: NarrativeText,
     ElementType.LIST_ITEM: ListItem,

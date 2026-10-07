@@ -9,9 +9,11 @@ from unstructured.file_utils.model import FileType
 from unstructured.partition.common.common import exactly_one
 from unstructured.partition.common.metadata import get_last_modified_date
 from unstructured.partition.docx import partition_docx
+from unstructured.telemetry import partition_runtime_telemetry
 from unstructured.utils import requires_dependencies
 
 
+@partition_runtime_telemetry("odt")
 def partition_odt(
     filename: Optional[str] = None,
     *,
@@ -106,8 +108,20 @@ def _convert_odt_to_docx(
 
     import pypandoc
 
-    pypandoc.convert_file(
-        source_file_path, "docx", format="odt", outputfile=target_docx_path, sandbox=True
-    )
+    # Try with sandbox=True first for security. If it fails due to Pandoc's known limitation
+    # with DOCX output in sandbox mode (see jgm/pandoc#8128), fallback without sandbox only
+    # if ALLOW_PANDOC_NO_SANDBOX env var is set to "true".
+    try:
+        pypandoc.convert_file(
+            source_file_path, "docx", format="odt", outputfile=target_docx_path, sandbox=True
+        )
+    except RuntimeError:
+        allow_no_sandbox = os.environ.get("ALLOW_PANDOC_NO_SANDBOX", "").lower() == "true"
+        if allow_no_sandbox:
+            pypandoc.convert_file(
+                source_file_path, "docx", format="odt", outputfile=target_docx_path
+            )
+        else:
+            raise
 
     return target_docx_path

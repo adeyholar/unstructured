@@ -39,9 +39,16 @@
 
 The `unstructured` library provides open-source components for ingesting and pre-processing images and text documents, such as PDFs, HTML, Word docs, and [many more](https://docs.unstructured.io/open-source/core-functionality/partitioning). The use cases of `unstructured` revolve around streamlining and optimizing the data processing workflow for LLMs. `unstructured` modular functions and connectors form a cohesive system that simplifies data ingestion and pre-processing, making it adaptable to different platforms and efficient in transforming unstructured data into structured outputs.
 
-## Try the Unstructured Platform Product
+> [!NOTE]
+> **The open-source library is, and will stay, completely free.** If you need higher-quality output, though, our latest models are available through the [Transform v2 API](https://docs.unstructured.io/transform/first-request). Compared with this library, Transform gets **2x table content accuracy**, **58% less invented content**, and **0.878 text accuracy (vs. 0.715)**:
+>
+> | Model | Table Cell Content | Table Cell Spatial | Adjusted CCT (text accuracy) | Tokens Added (lower is better) |
+> |---|---|---|---|---|
+> | **Transform (Best)** | **0.866** | **0.853** | **0.878** | **0.050** |
+> | Unstructured OSS | 0.426 | 0.498 | 0.715 | 0.119 |
+>
+> <sub>OSS: [unstructured.io/benchmarks](https://unstructured.io/benchmarks) (1,000+ pages). Transform Best: SCOREBench, 224 pages, Sept 2026.</sub>
 
-Ready to move your data processing pipeline to production, and take advantage of advanced features? Check out [Unstructured Platform](https://unstructured.io/enterprise). In addition to better processing performance, take advantage of chunking, embedding, and image and table enrichment generation, all from a low code UI or an API. [Request a demo](https://unstructured.io/contact) from our sales team to learn more about how to get started.
 
 ## :eight_pointed_black_star: Quick Start
 
@@ -115,7 +122,7 @@ installation.
     - `poppler-utils` (images and PDFs)
     - `tesseract-ocr` (images and PDFs, install `tesseract-lang` for additional language support)
     - `libreoffice` (MS Office docs)
-    - `pandoc` (EPUBs, RTFs and Open Office docs). Please note that to handle RTF files, you need version `2.14.2` or newer. Running either `make install-pandoc` or `./scripts/install-pandoc.sh` will install the correct version for you.
+    - `pandoc` is bundled automatically via the `pypandoc-binary` Python package (no system install needed)
 
 - For suggestions on how to install on the Windows and to learn about dependencies for other features, see the
   installation documentation [here](https://unstructured-io.github.io/unstructured/installing.html).
@@ -134,21 +141,37 @@ print("\n\n".join([str(el) for el in elements]))
 The following instructions are intended to help you get up and running with `unstructured`
 locally if you are planning to contribute to the project.
 
-* Using `pyenv` to manage virtualenv's is recommended but not necessary
-	* Mac install instructions. See [here](https://github.com/Unstructured-IO/community#mac--homebrew) for more detailed instructions.
-		* `brew install pyenv-virtualenv`
-	  * `pyenv install 3.10`
-  * Linux instructions are available [here](https://github.com/Unstructured-IO/community#linux).
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management. Install it first:
 
-* Create a virtualenv to work in and activate it, e.g. for one named `unstructured`:
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-	`pyenv  virtualenv 3.10 unstructured` <br />
-	`pyenv activate unstructured`
+Then install all dependencies (base, extras, dev, test, and lint groups):
 
-* Run `make install`
+```bash
+make install
+```
+
+This runs `uv sync --locked --all-extras --all-groups`, which creates a virtual environment
+and installs everything in one step. No need to manually create or activate a virtualenv.
+
+To install only specific document-type extras:
+
+```bash
+uv sync --extra pdf
+uv sync --extra csv --extra docx
+```
+
+To update the lock file after changing dependencies in `pyproject.toml`:
+
+```bash
+make lock
+```
 
 * Optional:
-  * To install models and dependencies for processing images and PDFs locally, run `make install-local-inference`.
+  * To install extras for processing images and PDFs locally, run `uv sync --extra pdf --extra image`.
   * For processing image files, `tesseract` is required. See [here](https://tesseract-ocr.github.io/tessdoc/Installation.html) for installation instructions.
   * For processing PDF files, `tesseract` and `poppler` are required. The [pdf2image docs](https://pdf2image.readthedocs.io/en/latest/installation.html) have instructions on installing `poppler` across various platforms.
 
@@ -252,4 +275,6 @@ Encountered a bug? Please create a new [GitHub issue](https://github.com/Unstruc
 
 ## :chart_with_upwards_trend: Analytics
 
-This library includes a very lightweight analytics "ping" when the library is loaded, however you can opt out of this data collection by setting the environment variable `DO_NOT_TRACK=true` before executing any `unstructured` code. To learn more about how we collect and use this data, please read our [Privacy Policy](https://unstructured.io/privacy-policy).
+Unstructured sends lightweight analytics to `GET https://packages.unstructured.io/python-telemetry` by default: one library-load ping when it is imported and one best-effort local attempt for each top-level public partition call. The shared endpoint supports separate startup and runtime query-parameter schemas. Runtime events contain the package version, normalized platform/Python/architecture values, fixed-enum partition characteristics, and aggregate final-element counts as URL query parameters; there is no request body. They never contain document or element content, filenames, paths, URLs supplied for partitioning, raw MIME values, exception details, credentials, proxy configuration, or persistent installation, machine, process, account, user, or developer identifiers. Runtime delivery never waits on the network from partition processing, has no redirects, retries, response-body download, or queue, and does not consult proxy or netrc environment settings. At most one telemetry daemon can remain stranded in a network operation; later events drop while that slot is occupied, and process exit does not wait for it. Connect/read timeouts limit socket operations, not total network wall-clock duration.
+
+To opt out before importing or partitioning, set either `DO_NOT_TRACK` or `SCARF_NO_ANALYTICS` to any non-empty value after trimming whitespace (for example, `true`, `1`, `yes`, `false`, or `0`); either variable disables both library-load and runtime telemetry. Unset the variables or leave them empty or whitespace-only to retain the default behavior. See our [Privacy Policy](https://unstructured.io/privacy-policy).

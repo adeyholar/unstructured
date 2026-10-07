@@ -10,6 +10,7 @@ from typing import Any, Generator, List, Optional, TypeVar, Union
 
 import numpy as np
 from matplotlib import colors, font_manager
+from numba import njit
 from PIL import Image, ImageDraw, ImageFont
 from unstructured_inference.constants import ElementType
 
@@ -75,6 +76,7 @@ def get_rgb_color(color: str) -> tuple[int, int, int]:
     return int(rgb_colors[0] * 255), int(rgb_colors[1] * 255), int(rgb_colors[2] * 255)
 
 
+@njit(cache=True, fastmath=True)
 def _get_bbox_to_page_ratio(bbox: tuple[int, int, int, int], page_size: tuple[int, int]) -> float:
     """Compute the ratio of the bounding box to the page size.
 
@@ -117,8 +119,10 @@ def _get_optimal_value_for_bbox(
         The optimal value for the given bounding box and parameters given.
     """
     bbox_to_page_ratio = _get_bbox_to_page_ratio(bbox, page_size)
-    coefficients = np.polyfit((ratio_for_min_value, ratio_for_max_value), (min_value, max_value), 1)
-    value = int(bbox_to_page_ratio * coefficients[0] + coefficients[1])
+    slope, intercept = _linear_polyfit_2point(
+        ratio_for_min_value, ratio_for_max_value, min_value, max_value
+    )
+    value = int(bbox_to_page_ratio * slope + intercept)
     return max(min_value, min(max_value, value))
 
 
@@ -383,6 +387,18 @@ def draw_bbox_on_image(
             )
 
 
+@njit(cache=True, fastmath=True)
+def _linear_polyfit_2point(x0: float, x1: float, y0: float, y1: float):
+    """Compute slope and intercept for a line passing through (x0, y0), (x1, y1)."""
+    if x1 == x0:
+        slope = 0.0
+        intercept = (y0 + y1) / 2.0
+    else:
+        slope = (y1 - y0) / (x1 - x0)
+        intercept = y0 - slope * x0
+    return slope, intercept
+
+
 class LayoutDrawer(ABC):
     layout_source: str = "unknown"
     laytout_dump: dict
@@ -499,7 +515,8 @@ class FinalLayoutDrawer(LayoutDrawer):
         "NarrativeText": "turquoise",
         "Header": "green",
         "Footer": "orange",
-        "FigureCaption" "Image": "sienna",
+        "FigureCaption": "sienna",
+        "Image": "sienna",
         "Table": "blue",
         "Address": "gold",
         "EmailAddress": "lightskyblue",
@@ -671,8 +688,15 @@ class AnalysisDrawer(AnalysisProcessor):
                     image_paths = [self.filename]
             else:
                 try:
+                    str_filename = (
+                        ""
+                        if (self.filename is None or self.file is not None)
+                        else (
+                            str(self.filename) if isinstance(self.filename, Path) else self.filename
+                        )
+                    )
                     image_paths = convert_pdf_to_image(
-                        filename=self.filename,
+                        filename=str_filename,
                         file=self.file,
                         output_folder=temp_dir,
                         path_only=True,
@@ -684,5 +708,5 @@ class AnalysisDrawer(AnalysisProcessor):
                     )
 
             for image_path in image_paths:
-                with Image.open(image_path) as image:
+                with Image.open(str(image_path)) as image:
                     yield image.convert("RGB")

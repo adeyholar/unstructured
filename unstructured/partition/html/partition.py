@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-from typing import IO, Any, Iterator, List, Literal, Optional, cast
+from functools import cached_property
+from typing import IO, Any, Callable, Iterator, List, Literal, Optional, cast
 
-import requests
 from lxml import etree
 
 from unstructured.chunking import add_chunking_strategy
@@ -19,9 +19,12 @@ from unstructured.partition.html.transformations import (
     ontology_to_unstructured_elements,
     parse_html_to_ontology,
 )
-from unstructured.utils import is_temp_file_path, lazyproperty
+from unstructured.safe_http import safe_get
+from unstructured.telemetry import partition_runtime_telemetry
+from unstructured.utils import is_temp_file_path
 
 
+@partition_runtime_telemetry("html")
 @apply_metadata(FileType.HTML)
 @add_chunking_strategy
 def partition_html(
@@ -39,6 +42,9 @@ def partition_html(
     image_alt_mode: Optional[Literal["to_text"]] = "to_text",
     extract_image_block_to_payload: bool = False,
     extract_image_block_types: Optional[list[str]] = None,
+    languages: Optional[list[str]] = None,
+    detect_language_per_element: bool = False,
+    language_fallback: Optional[Callable[[str], Optional[list[str]]]] = None,
     **kwargs: Any,
 ) -> list[Element]:
     """Partitions an HTML document into its constituent elements.
@@ -71,6 +77,13 @@ def partition_html(
 
     image_alt_mode (Literal['to_text']):
         When set 'to_text', the v2 parser will include the alternative text of images in the output.
+
+    languages
+        The languages present in the document. Use ``["auto"]`` to detect; use ``[""]`` to disable.
+    detect_language_per_element
+        Detect language per element instead of at the document level.
+    language_fallback
+        Optional callable for short text; called with the text, return ISO 639-3 codes or None.
     """
     # -- parser rejects an empty str, nip that edge-case in the bud here --
     if text is not None and text.strip() == "" and not file and not filename and not url:
@@ -129,12 +142,12 @@ class HtmlPartitionerOptions:
         self._extract_image_block_types = extract_image_block_types
         self._extract_image_block_to_payload = extract_image_block_to_payload
 
-    @lazyproperty
+    @cached_property
     def detection_origin(self) -> str | None:
         """Trace of initial partitioner to be included in metadata for debugging purposes."""
         return self._detection_origin
 
-    @lazyproperty
+    @cached_property
     def html_text(self) -> str:
         """The HTML document as a string, loaded from wherever the caller specified."""
         if self._file_path:
@@ -147,7 +160,7 @@ class HtmlPartitionerOptions:
             return str(self._text)
 
         if self._url:
-            response = requests.get(self._url, headers=self._headers, verify=self._ssl_verify)
+            response = safe_get(self._url, headers=self._headers, verify=self._ssl_verify)
             if not response.ok:
                 raise ValueError(
                     f"Error status code on GET of provided URL: {response.status_code}"
@@ -160,7 +173,7 @@ class HtmlPartitionerOptions:
 
         raise ValueError("Exactly one of filename, file, text, or url must be specified.")
 
-    @lazyproperty
+    @cached_property
     def last_modified(self) -> str | None:
         """The best last-modified date available, None if no sources are available."""
         return (
@@ -169,17 +182,17 @@ class HtmlPartitionerOptions:
             else get_last_modified_date(self._file_path)
         )
 
-    @lazyproperty
+    @cached_property
     def skip_headers_and_footers(self) -> bool:
         """When True, elements located within a header or footer are pruned."""
         return self._skip_headers_and_footers
 
-    @lazyproperty
+    @cached_property
     def html_parser_version(self) -> Literal["v1", "v2"]:
         """When html_parser_version=='v2', HTML elements follow ontology schema."""
         return self._html_parser_version
 
-    @lazyproperty
+    @cached_property
     def add_img_alt_text(self) -> bool:
         """When True, the alternative text of images is included in the output."""
         return self._image_alt_mode == "to_text"
@@ -231,7 +244,7 @@ class _HtmlPartitioner:
                 e.metadata.image_mime_type = None
             yield e
 
-    @lazyproperty
+    @cached_property
     def _main(self) -> Flow:
         """The root HTML element."""
         # NOTE(scanny) - get `html_text` first so any encoding error raised is not confused with a
@@ -265,7 +278,7 @@ class _HtmlPartitioner:
             return cast(Flow, body)
         return cast(Flow, root)
 
-    @lazyproperty
+    @cached_property
     def _from_ontology(self) -> List[Element]:
         """Convert an ontology elements represented in HTML to an ontology element."""
         html_text = self._opts.html_text

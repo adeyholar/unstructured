@@ -10,7 +10,15 @@ from collections import deque
 import pytest
 from lxml import etree
 
-from unstructured.documents.elements import Address, Element, ListItem, NarrativeText, Text, Title
+from unstructured.documents.elements import (
+    Address,
+    CodeSnippet,
+    Element,
+    ListItem,
+    NarrativeText,
+    Text,
+    Title,
+)
 from unstructured.partition.html.parser import (
     Annotation,
     DefaultElement,
@@ -315,6 +323,27 @@ class Describe_ElementAccumulator:
 
         assert accum._normalized_text == "Ford... you're turning into a penguin."
 
+    # -- page_number --------------------------------------------------------
+
+    def it_includes_page_number_in_metadata_when_ancestor_has_data_page_number(self):
+        html = '<div data-page-number="2"><p>text</p></div>'
+        p = etree.fromstring(html, html_parser).xpath(".//p")[0]
+        accum = _ElementAccumulator(p)
+        accum.add(TextSegment("Ford... you're turning into a penguin.", {}))
+
+        (element,) = accum.flush(None)
+
+        assert element.metadata.page_number == 2
+
+    def it_leaves_page_number_None_when_no_data_page_number_in_tree(self):
+        p = etree.fromstring("<p/>", html_parser).xpath(".//p")[0]
+        accum = _ElementAccumulator(p)
+        accum.add(TextSegment("Ford... you're turning into a penguin.", {}))
+
+        (element,) = accum.flush(None)
+
+        assert element.metadata.page_number is None
+
     # -- fixtures --------------------------------------------------------------------------------
 
     @pytest.fixture()
@@ -343,6 +372,80 @@ class Describe_PreElementAccumulator:
 
 
 # -- FLOW (BLOCK-ITEM) ELEMENTS ------------------------------------------------------------------
+
+
+class DescribeListItemBlock:
+    @pytest.mark.parametrize("tag", ["p", "div", "blockquote"])
+    @pytest.mark.parametrize("text", ["list item one.", "A", "* literal bullet"])
+    def it_adopts_a_single_text_block(self, tag: str, text: str):
+        root = etree.fromstring(f"<ul><li>\n<{tag}>{text}</{tag}>\n</li></ul>", html_parser)
+
+        (element,) = root.find("body").iter_elements()
+
+        assert element == ListItem(text)
+        assert element.metadata.category_depth == 1
+
+    def it_preserves_annotations_and_nested_list_depth(self):
+        root = etree.fromstring(
+            '<ul><li>outer<ul><li data-page-number="3"><p>'
+            '<a href="https://example.com">link</a> <b>bold</b>'
+            "</p></li></ul></li></ul>",
+            html_parser,
+        )
+
+        outer, inner = root.find("body").iter_elements()
+
+        assert outer == ListItem("outer")
+        assert inner == ListItem("link bold")
+        assert inner.metadata.category_depth == 2
+        assert inner.metadata.page_number == 3
+        assert inner.metadata.link_texts == ["link"]
+        assert inner.metadata.link_urls == ["https://example.com"]
+        assert inner.metadata.emphasized_text_contents == ["bold"]
+        assert inner.metadata.emphasized_text_tags == ["b"]
+
+    def it_preserves_child_page_number_and_following_text(self):
+        root = etree.fromstring(
+            '<ul data-page-number="2"><li><p data-page-number="3">'
+            "first<br>second</p></li>following text</ul>",
+            html_parser,
+        )
+
+        item, following = root.find("body").iter_elements()
+
+        assert item == ListItem("first second")
+        assert item.metadata.page_number == 3
+        assert following.text == "following text"
+        assert following.metadata.page_number == 2
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<p>first paragraph</p><p>second paragraph</p>",
+            "prefix<p>paragraph text</p>",
+            "<p>paragraph text</p>suffix",
+            "<b>prefix</b><p>paragraph text</p>",
+            "<div><p>first paragraph</p><p>second paragraph</p></div>",
+            "<div><span><p>first paragraph</p><p>second paragraph</p></span></div>",
+            "<ul><li>nested item</li></ul>",
+            "<pre>  code\n  block</pre>",
+            "<h2>heading text</h2>",
+            "<table><tr><td>cell text</td></tr></table>",
+            '<img src="https://example.com/image.png" alt="picture">',
+            "<figure>ignored text</figure>",
+            "<p> </p>",
+            "plain list item",
+        ],
+    )
+    def it_retains_normal_traversal_for_other_content(self, content: str):
+        root = etree.fromstring(f"<ul><li>{content}</li></ul>", html_parser)
+        li = root.xpath(".//li")[0]
+
+        actual = list(li.iter_elements())
+        expected = list(Flow.iter_elements(li))
+
+        assert actual == expected
+        assert [e.metadata.to_dict() for e in actual] == [e.metadata.to_dict() for e in expected]
 
 
 class DescribeFlow:
@@ -409,6 +512,50 @@ class DescribeFlow:
         }
         with pytest.raises(StopIteration):
             e = next(elements)
+
+    def it_ignores_a_processing_instruction_node(self):
+        """A stray `<?xml ...?>` in the HTML must not break element iteration (issue #4358).
+
+        `remove_pis=True` on the parser drops the processing-instruction node, so it never
+        reaches the traversal as a bare `_ProcessingInstruction` (which has no `.is_phrasing`).
+        """
+        html_text = '<div><p>before</p><?xml version="1.0"?><p>after</p></div>'
+        div = etree.fromstring(html_text, html_parser).xpath(".//div")[0]
+
+        elements = list(div.iter_elements())
+
+        assert elements == [Text("before"), Text("after")]
+
+    # -- ._page_number ----------------------------------------------------
+
+    def it_returns_None_when_no_data_page_number_in_tree(self):
+        p = etree.fromstring("<div><p>text</p></div>", html_parser).xpath(".//p")[0]
+        assert p._page_number is None
+
+    def it_finds_page_number_from_ancestor(self):
+        html = '<div data-page-number="1"><p>text</p></div>'
+        p = etree.fromstring(html, html_parser).xpath(".//p")[0]
+        assert p._page_number == 1
+
+    def it_finds_page_number_on_self(self):
+        html = '<div data-page-number="3"><span>text</span></div>'
+        div = etree.fromstring(html, html_parser).xpath(".//div")[0]
+        assert div._page_number == 3
+
+    def it_returns_nearest_ancestors_page_number(self):
+        html = '<div data-page-number="1"><div data-page-number="2"><p>text</p></div></div>'
+        p = etree.fromstring(html, html_parser).xpath(".//p")[0]
+        assert p._page_number == 2
+
+    def it_returns_None_for_non_numeric_data_page_number(self):
+        html = '<div data-page-number="abc"><p>text</p></div>'
+        p = etree.fromstring(html, html_parser).xpath(".//p")[0]
+        assert p._page_number is None
+
+    def it_falls_back_to_outer_page_number_when_inner_is_non_numeric(self):
+        html = '<div data-page-number="1"><div data-page-number="abc"><p>text</p></div></div>'
+        p = etree.fromstring(html, html_parser).xpath(".//p")[0]
+        assert p._page_number == 1
 
     # -- ._element_from_text_or_tail() ------------------------------------
 
@@ -536,7 +683,7 @@ class DescribePre:
         elements = pre.iter_elements()
 
         e = next(elements)
-        assert e == Text(
+        assert e == CodeSnippet(
             "  The Answer to the Great Question...   Of Life, the Universe and Everything...\n"
             "  Is... Forty-two, said Deep Thought, with infinite majesty and calm."
         )
@@ -584,6 +731,19 @@ class DescribePre:
         assert e.metadata.emphasized_text_tags == ["b"]
         assert e.metadata.link_texts == ["penguin"]
         assert e.metadata.link_urls == ["http://eie.io"]
+
+    def it_generates_CodeSnippet_elements_to_preserve_code_formatting(self):
+        """Pre elements should generate CodeSnippet elements, not generic Text elements.
+
+        This ensures code formatting (whitespace, line breaks) is preserved during chunking.
+        """
+        html_text = "<pre>def hello():\n    print('Hello')\n    return True</pre>"
+        pre = etree.fromstring(html_text, html_parser).xpath(".//pre")[0]
+
+        e = next(pre.iter_elements())
+
+        assert isinstance(e, CodeSnippet)
+        assert e.text == "def hello():\n    print('Hello')\n    return True"
 
 
 class DescribeRemovedBlock:

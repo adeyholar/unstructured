@@ -5,18 +5,39 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import functools
-import itertools
 import os
 from typing import Any, Callable, Iterator, Sequence
 
 from typing_extensions import ParamSpec
 
-from unstructured.documents.elements import Element, ElementMetadata
+from unstructured.documents.elements import Element, ElementMetadata, ListItem, Title
 from unstructured.file_utils.model import FileType
 from unstructured.partition.common.lang import apply_lang_metadata
 from unstructured.utils import get_call_args_applying_defaults
 
 _P = ParamSpec("_P")
+
+# -- Name of a transient, in-process attribute used to identify elements produced by partitioning
+# -- an attachment. It is deliberately NOT an `ElementMetadata` field: it must not appear in
+# -- dict/JSON output, and it must work when the containing document's file-name is unknown --
+# -- which is exactly when `.metadata.attached_to_filename` is `None` and so cannot serve as the
+# -- marker (e.g. `partition(file=f)` with no `metadata_filename`).
+_ATTACHMENT_ELEMENT_ATTR = "_produced_by_attachment_partitioning"
+
+
+def mark_as_attachment_element(element: Element) -> None:
+    """Record that `element` was produced by partitioning an attachment.
+
+    Attachment elements are partitioned by a nested `partition()` call, which assigns them their
+    own (correct) source-document metadata. Marking them lets the containing document's partitioner
+    avoid overwriting that metadata with its own.
+    """
+    setattr(element, _ATTACHMENT_ELEMENT_ATTR, True)
+
+
+def is_attachment_element(element: Element) -> bool:
+    """True when `element` was produced by partitioning an attachment."""
+    return getattr(element, _ATTACHMENT_ELEMENT_ATTR, False) is True
 
 
 def get_last_modified_date(filename: str) -> str | None:
@@ -59,6 +80,42 @@ HIERARCHY_RULE_SET = {
         "Table",
     ],
 }
+
+
+# Canonical HTML heading levels -> zero-indexed category_depth. The HTML spec
+# defines exactly six heading levels (there is no h7), so this closed mapping is
+# the single source of truth for both the depth value and the heading-tag set
+# (HEADING_TAGS is derived from it, not a second copy).
+_HEADING_DEPTH = {"h1": 0, "h2": 1, "h3": 2, "h4": 3, "h5": 4, "h6": 5}
+HEADING_TAGS = tuple(_HEADING_DEPTH)
+
+
+def category_depth_from_html_tag(
+    ElementCls: type[Element], tag: str | None, list_ancestor_count: int = 0
+) -> int | None:
+    """Compute `category_depth` from an element's HTML heading level (not DOM-nesting depth).
+
+    This is the canonical mapping used by both the v1 HTML parser and the v2 (ontology) HTML
+    converter so the two paths agree on what `category_depth` means:
+
+    - `Title` (which includes ontology Title/Subtitle/Heading, i.e. ``<h1>``-``<h6>``): the heading
+      level, zero-indexed -- ``h1`` -> 0, ``h2`` -> 1, ... ``h6`` -> 5. A `Title` whose tag is not a
+      heading (e.g. a styled paragraph) is treated as a top-level heading (0).
+    - `ListItem`: the number of enclosing list containers (``ol``/``ul``/``dl``), passed in by the
+      caller (the v1 HTML parser, which computes it from list nesting). The v2 converter serializes
+      a whole ``ol``/``ul``/``dl`` as one element and never emits a standalone ``ListItem``, so it
+      does not use this.
+    - Everything else: ``None`` (no meaningful depth).
+
+    `tag` is the element's HTML tag name (e.g. ``"h2"``); it may be ``None`` for derived elements.
+    """
+    if ElementCls is ListItem:
+        return list_ancestor_count
+
+    if ElementCls is Title:
+        return _HEADING_DEPTH.get(tag, 0)
+
+    return None
 
 
 def set_element_hierarchy(
@@ -181,11 +238,13 @@ def apply_metadata(
             # -- `language` - auto-detect language (e.g. eng, spa) --
             languages = call_args.get("languages")
             detect_language_per_element = call_args.get("detect_language_per_element", False)
+            language_fallback = call_args.get("language_fallback")
             elements = list(
                 apply_lang_metadata(
                     elements=elements,
                     languages=languages,
                     detect_language_per_element=detect_language_per_element,
+                    language_fallback=language_fallback,
                 )
             )
 
@@ -245,22 +304,31 @@ def apply_metadata(
 
 
 def _assign_hash_ids(elements: list[Element]) -> list[Element]:
-    """Converts `.id` of each element from UUID to hash.
+    """Converts `.id` of each element from UUID to hash and remaps `parent_id` accordingly.
 
     The hash is based on the `.text` of the element, but also on its page-number and sequence number
     on that page. This provides for deterministic results even when the document is split into one
     or more fragments for parallel processing.
+
+    After hashing, any `element.metadata.parent_id` that references a known original UUID is
+    updated to the corresponding new hash ID. Parent IDs that do not appear in the mapping (e.g.
+    because the parent element was filtered out before hashing, or the ID was set manually to an
+    external value) are left unchanged.
     """
     # -- generate sequence number for each element on a page --
-    page_numbers = [e.metadata.page_number for e in elements]
-    page_seq_numbers = [
-        seq_on_page
-        for _, group in itertools.groupby(page_numbers)
-        for seq_on_page, _ in enumerate(group)
-    ]
-
-    for element, seq_on_page_counter in zip(elements, page_seq_numbers):
+    page_seq_counts = {}
+    id_mapping = {}
+    for element in elements:
+        page_number = element.metadata.page_number
+        seq_on_page_counter = page_seq_counts.get(page_number, 0)
+        original_id = element.id
         element.id_to_hash(seq_on_page_counter)
+        id_mapping[original_id] = element.id
+        page_seq_counts[page_number] = seq_on_page_counter + 1
+
+    for element in elements:
+        if element.metadata.parent_id is not None and element.metadata.parent_id in id_mapping:
+            element.metadata.parent_id = id_mapping[element.metadata.parent_id]
 
     return elements
 

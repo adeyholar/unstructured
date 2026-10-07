@@ -1,9 +1,11 @@
+import logging
 import pathlib
 from multiprocessing import Pool
 
 import numpy as np
 import pytest
 from PIL import Image
+from unstructured_inference.constants import IsExtracted
 from unstructured_inference.inference import layout
 from unstructured_inference.inference.elements import TextRegion
 from unstructured_inference.inference.layoutelement import LayoutElement
@@ -348,6 +350,40 @@ def test_convert_office_doc_captures_errors(monkeypatch, caplog):
     assert "soffice failed to convert to format docx with code 1" in caplog.text
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_convert_office_doc_survives_non_utf8_soffice_output(stream, monkeypatch, caplog):
+    """A non-UTF-8 console must not abort the call, on either captured stream.
+
+    LibreOffice echoes the input path using the console encoding, which on Windows is the
+    locale codepage rather than UTF-8. A document with a multi-byte name -- `文章.doc` here,
+    echoed as CP932 -- made the strict decode raise, failing a conversion `soffice` had already
+    done. `stderr` goes through the same decode on the failure branch.
+    """
+    from unstructured.partition.common.common import subprocess
+
+    caplog.set_level(logging.INFO, logger="unstructured")
+    # -- "convert 文章.doc -> 文章.docx" as a Japanese console would emit it --
+    non_utf8 = "convert 文章.doc -> 文章.docx".encode("cp932")
+    # -- stdout must stay non-empty in the stderr case or the retry loop spins instead --
+    returncode, stdout, stderr = (
+        (0, non_utf8, b"") if stream == "stdout" else (1, b"soffice ran", non_utf8)
+    )
+
+    def mock_run(*args, **kwargs):
+        return MockRunOutput(returncode, stdout, stderr)
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    common.convert_office_doc("文章.doc", "fake-directory", target_format="docx")
+
+    # -- the ASCII part survives, the undecodable bytes are shown, and the whole record is
+    # -- still encodable by a handler using the locale codepage --
+    assert "convert" in caplog.text
+    assert ".docx" in caplog.text
+    assert r"\x95\xb6" in caplog.text
+    caplog.text.encode("ascii")
+
+
 def test_convert_office_docs_avoids_concurrent_call_to_soffice():
     paths_to_save = [pathlib.Path(path) for path in ("/tmp/proc1", "/tmp/proc2", "/tmp/proc3")]
     for path in paths_to_save:
@@ -445,3 +481,23 @@ def test_ocr_data_to_elements():
             points=layout_el.bbox.coordinates,
             system=coordinate_system,
         )
+
+
+def test_normalize_layout_element_layout_element_text_source_metadata():
+    layout_element = LayoutElement.from_coords(
+        type="NarrativeText",
+        x1=1,
+        y1=2,
+        x2=3,
+        y2=4,
+        text="Some lovely text",
+        is_extracted=IsExtracted.TRUE,
+    )
+    coordinate_system = PixelSpace(width=10, height=20)
+    element = common.normalize_layout_element(
+        layout_element,
+        coordinate_system=coordinate_system,
+    )
+    assert hasattr(element, "metadata")
+    assert hasattr(element.metadata, "is_extracted")
+    assert element.metadata.is_extracted == "true"

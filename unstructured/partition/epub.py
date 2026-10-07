@@ -8,17 +8,19 @@ from unstructured.file_utils.model import FileType
 from unstructured.partition.common.common import exactly_one
 from unstructured.partition.common.metadata import get_last_modified_date
 from unstructured.partition.html import partition_html
+from unstructured.telemetry import partition_runtime_telemetry
 
 DETECTION_ORIGIN: str = "epub"
 
 
+@partition_runtime_telemetry("epub")
 def partition_epub(
     filename: Optional[str] = None,
     *,
     file: Optional[IO[bytes]] = None,
     metadata_filename: Optional[str] = None,
     metadata_last_modified: Optional[str] = None,
-    languages: Optional[list[str]] = ["auto"],
+    languages: Optional[list[str]] = None,
     detect_language_per_element: bool = False,
     **kwargs: Any,
 ) -> list[Element]:

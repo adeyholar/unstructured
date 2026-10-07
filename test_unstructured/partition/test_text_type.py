@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
-from test_unstructured.nlp.mock_nltk import (
+from test_unstructured.nlp.mock_nlp import (
     mock_pos_tag,
     mock_sent_tokenize,
     mock_word_tokenize,
@@ -170,6 +170,12 @@ def test_contains_us_phone_number(text, expected):
         ("  This is a fine point!", True),
         ("* This is a fine point!", True),
         ("- This is a fine point!", True),
+        ("– This is a fine point!", True),  # EN DASH followed by a space
+        ("-", True),  # a lone dash is an empty bullet
+        ("-123.45", False),  # a minus sign, not a bullet
+        ("–10 °C", False),  # ditto, EN DASH
+        ("-item", False),  # a bullet is separated from the item it introduces
+        ("•item", True),  # unambiguous glyphs need no separator
         ("This is NOT a fine point!", False),  # No bullet point
         ("I love morse code! ● ● ● --- ● ● ●", False),  # Not at the beginning
         ("----------------------------", False),  # Too long
@@ -234,7 +240,7 @@ def test_contains_exceeds_cap_ratio(text, expected, monkeypatch):
 def test_set_caps_ratio_with_environment_variable(monkeypatch):
     monkeypatch.setattr(text_type, "word_tokenize", mock_word_tokenize)
     monkeypatch.setattr(text_type, "sent_tokenize", mock_sent_tokenize)
-    monkeypatch.setenv("UNSTRUCTURED_NARRATIVE_TEXT_CAP_THRESHOLD", 0.8)
+    monkeypatch.setenv("UNSTRUCTURED_NARRATIVE_TEXT_CAP_THRESHOLD", str(0.8))
 
     text = "All The King's Horses. And All The King's Men."
     with patch.object(text_type, "exceeds_cap_ratio", return_value=False) as mock_exceeds:
@@ -246,7 +252,7 @@ def test_set_caps_ratio_with_environment_variable(monkeypatch):
 def test_set_title_non_alpha_threshold_with_environment_variable(monkeypatch):
     monkeypatch.setattr(text_type, "word_tokenize", mock_word_tokenize)
     monkeypatch.setattr(text_type, "sent_tokenize", mock_sent_tokenize)
-    monkeypatch.setenv("UNSTRUCTURED_TITLE_NON_ALPHA_THRESHOLD", 0.8)
+    monkeypatch.setenv("UNSTRUCTURED_TITLE_NON_ALPHA_THRESHOLD", str(0.8))
 
     text = "/--------------- All the king's horses----------------/"
     with patch.object(text_type, "under_non_alpha_ratio", return_value=False) as mock_exceeds:
@@ -258,7 +264,7 @@ def test_set_title_non_alpha_threshold_with_environment_variable(monkeypatch):
 def test_set_narrative_text_non_alpha_threshold_with_environment_variable(monkeypatch):
     monkeypatch.setattr(text_type, "word_tokenize", mock_word_tokenize)
     monkeypatch.setattr(text_type, "sent_tokenize", mock_sent_tokenize)
-    monkeypatch.setenv("UNSTRUCTURED_NARRATIVE_TEXT_NON_ALPHA_THRESHOLD", 0.8)
+    monkeypatch.setenv("UNSTRUCTURED_NARRATIVE_TEXT_NON_ALPHA_THRESHOLD", str(0.8))
 
     text = "/--------------- All the king's horses----------------/"
     with patch.object(text_type, "under_non_alpha_ratio", return_value=False) as mock_exceeds:
@@ -270,7 +276,7 @@ def test_set_narrative_text_non_alpha_threshold_with_environment_variable(monkey
 def test_set_title_max_word_length_with_environment_variable(monkeypatch):
     monkeypatch.setattr(text_type, "word_tokenize", mock_word_tokenize)
     monkeypatch.setattr(text_type, "sent_tokenize", mock_sent_tokenize)
-    monkeypatch.setenv("UNSTRUCTURED_TITLE_MAX_WORD_LENGTH", 5)
+    monkeypatch.setenv("UNSTRUCTURED_TITLE_MAX_WORD_LENGTH", str(5))
 
     text = "Intellectual Property in the United States"
     assert text_type.is_possible_narrative_text(text) is False

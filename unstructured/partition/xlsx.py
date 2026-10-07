@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import io
+from functools import cached_property
 from typing import IO, Any, Iterator, Optional
 
 import networkx as nx
 import numpy as np
+import openpyxl
 import pandas as pd
+import xlrd
 from msoffcrypto import OfficeFile
 from msoffcrypto.exceptions import FileFormatError
 from typing_extensions import Self, TypeAlias
@@ -33,13 +36,18 @@ from unstructured.partition.text_type import (
     is_possible_numbered_list,
     is_possible_title,
 )
-from unstructured.utils import lazyproperty
+from unstructured.partition.utils.config import env_config
+from unstructured.telemetry import partition_runtime_telemetry
 
 _CellCoordinate: TypeAlias = "tuple[int, int]"
 
 DETECTION_ORIGIN: str = "xlsx"
 
+_ZIP_SIGNATURE = b"PK\x03\x04"
+_OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
+
+@partition_runtime_telemetry("xlsx")
 @apply_metadata(FileType.XLSX)
 @add_chunking_strategy
 def partition_xlsx(
@@ -153,7 +161,7 @@ class _XlsxPartitionerOptions:
         self._include_header = include_header
         self._infer_table_structure = infer_table_structure
 
-    @lazyproperty
+    @cached_property
     def find_subtable(self) -> bool:
         """True when partitioner should detect and emit separate `Table` elements for subtables.
 
@@ -161,32 +169,32 @@ class _XlsxPartitionerOptions:
         """
         return self._find_subtable
 
-    @lazyproperty
+    @cached_property
     def header_row_idx(self) -> int | None:
         """The index of the row Pandas should treat as column-headings. Either 0 or None."""
         return 0 if self._include_header else None
 
-    @lazyproperty
+    @cached_property
     def include_header(self) -> bool:
         """True when column headers should be included in tables."""
         return self._include_header
 
-    @lazyproperty
+    @cached_property
     def infer_table_structure(self) -> bool:
         """True when partitioner should compute and apply `text_as_html` metadata."""
         return self._infer_table_structure
 
-    @lazyproperty
+    @cached_property
     def last_modified(self) -> Optional[str]:
         """The best last-modified date available, None if no sources are available."""
         return get_last_modified_date(self._file_path) if self._file_path else None
 
-    @lazyproperty
+    @cached_property
     def metadata_file_path(self) -> str | None:
         """The best available file-path for this document or `None` if unavailable."""
         return self._file_path
 
-    @lazyproperty
+    @cached_property
     def sheets(self) -> dict[str, pd.DataFrame]:
         """The spreadsheet worksheets, each as a data-frame mapped by sheet-name."""
         try:
@@ -197,11 +205,30 @@ class _XlsxPartitionerOptions:
         if office_file.is_encrypted():
             raise UnprocessableEntityError("XLSX file is password protected.")
 
+        # -- Pandas allocates a dense data-frame spanning every worksheet out to its farthest
+        # -- populated cell, so a tiny file with one far-away cell can exhaust memory. Measure
+        # -- that span cheaply before reading, and pin the engine to the one that was measured.
+        engine = self._excel_engine
+        _check_worksheet_cell_count(self._file_bytes, engine, env_config.XLSX_MAX_CELLS)
+
         return pd.read_excel(
-            io.BytesIO(self._file_bytes), sheet_name=None, header=self.header_row_idx
+            io.BytesIO(self._file_bytes),
+            sheet_name=None,
+            header=self.header_row_idx,
+            engine=engine,
         )
 
-    @lazyproperty
+    @cached_property
+    def _excel_engine(self) -> str:
+        """The Pandas engine for this file: "openpyxl" for XLSX (zip), "xlrd" for XLS (OLE)."""
+        file_bytes = self._file_bytes
+        if file_bytes.startswith(_ZIP_SIGNATURE):
+            return "openpyxl"
+        if file_bytes.startswith(_OLE_SIGNATURE):
+            return "xlrd"
+        raise UnprocessableEntityError("Not a valid XLSX or XLS file.")
+
+    @cached_property
     def _file_bytes(self) -> bytes:
         if file := self._file:
             file.seek(0)
@@ -224,7 +251,7 @@ class _ConnectedComponent:
         self._worksheet = worksheet
         self._cell_coordinate_set = cell_coordinate_set
 
-    @lazyproperty
+    @cached_property
     def max_x(self) -> int:
         """The right-most column index of the connected component."""
         return self._extents[2]
@@ -239,12 +266,12 @@ class _ConnectedComponent:
             self._worksheet, self._cell_coordinate_set.union(other._cell_coordinate_set)
         )
 
-    @lazyproperty
+    @cached_property
     def min_x(self) -> int:
         """The left-most column index of the connected component."""
         return self._extents[0]
 
-    @lazyproperty
+    @cached_property
     def subtable(self) -> pd.DataFrame:
         """The connected region of the worksheet as a `DataFrame`.
 
@@ -254,7 +281,7 @@ class _ConnectedComponent:
         min_x, min_y, max_x, max_y = self._extents
         return self._worksheet.iloc[min_x : max_x + 1, min_y : max_y + 1]
 
-    @lazyproperty
+    @cached_property
     def _extents(self) -> tuple[int, int, int, int]:
         """Compute bounding box of this connected component."""
         min_x, min_y, max_x, max_y = float("inf"), float("inf"), float("-inf"), float("-inf")
@@ -288,18 +315,28 @@ class _ConnectedComponents:
         """Construct from a worksheet dataframe produced by reading Excel with pandas."""
         return cls(worksheet_df)
 
-    @lazyproperty
+    @cached_property
     def _connected_components(self) -> list[_ConnectedComponent]:
         """The `_ConnectedComponent` objects comprising this collection."""
         # -- produce a 2D-graph representing the populated cells of the worksheet (or subsheet).
         # -- A 2D-graph relates each populated cell to the one above, below, left, and right of it.
-        max_row, max_col = self._worksheet_df.shape
-        node_array = np.indices((max_row, max_col)).T
-        empty_cells = self._worksheet_df.isna().T
-        nodes_to_remove = [tuple(pair) for pair in node_array[empty_cells]]  # pyright: ignore
-
-        graph: nx.Graph = nx.grid_2d_graph(max_row, max_col)  # pyright: ignore
-        graph.remove_nodes_from(nodes_to_remove)  # pyright: ignore
+        # -- Only populated cells become nodes; a worksheet is mostly empty when it has a stray
+        # -- far-away cell, and a node per empty cell would cost ~1KB each.
+        # -- `dtype=bool` is required: `.notna()` on an empty (0x0) worksheet produces a float64
+        # -- array, and `&` on floats raises `TypeError: ufunc 'bitwise_and' not supported` below --
+        populated = self._worksheet_df.notna().to_numpy(dtype=bool)
+        graph: nx.Graph = nx.Graph()  # pyright: ignore[reportMissingTypeArgument]
+        graph.add_nodes_from(_cell_coordinates(*np.nonzero(populated)))  # pyright: ignore
+        # -- vertical edges, between each populated cell and a populated cell below it --
+        rows, cols = np.nonzero(populated[:-1, :] & populated[1:, :])
+        graph.add_edges_from(  # pyright: ignore
+            zip(_cell_coordinates(rows, cols), _cell_coordinates(rows + 1, cols))
+        )
+        # -- horizontal edges, between each populated cell and a populated cell right of it --
+        rows, cols = np.nonzero(populated[:, :-1] & populated[:, 1:])
+        graph.add_edges_from(  # pyright: ignore
+            zip(_cell_coordinates(rows, cols), _cell_coordinates(rows, cols + 1))
+        )
 
         # -- compute sets of nodes representing each connected-component --
         connected_node_sets: Iterator[set[_CellCoordinate]]
@@ -367,7 +404,7 @@ class _SubtableParser:
     def __init__(self, subtable: pd.DataFrame):
         self._subtable = subtable
 
-    @lazyproperty
+    @cached_property
     def core_table(self) -> pd.DataFrame | None:
         """The part between the leading and trailing single-cell rows, if any."""
         core_table_start = len(self._leading_single_cell_row_indices)
@@ -395,7 +432,7 @@ class _SubtableParser:
         for row_idx in self._trailing_single_cell_row_indices:
             yield self._subtable.iloc[row_idx].dropna().iloc[0]  # pyright: ignore
 
-    @lazyproperty
+    @cached_property
     def _leading_single_cell_row_indices(self) -> tuple[int, ...]:
         """Index of each leading single-cell row in subtable, in top-down order."""
 
@@ -407,7 +444,7 @@ class _SubtableParser:
 
         return tuple(iter_leading_single_cell_row_indices())
 
-    @lazyproperty
+    @cached_property
     def _single_cell_row_indices(self) -> tuple[int, ...]:
         """Index of each single-cell row in subtable, in top-down order."""
 
@@ -419,7 +456,7 @@ class _SubtableParser:
 
         return tuple(iter_single_cell_row_idxs())
 
-    @lazyproperty
+    @cached_property
     def _trailing_single_cell_row_indices(self) -> tuple[int, ...]:
         """Index of each trailing single-cell row in subtable, in top-down order."""
         # -- if all subtable rows are single-cell, then by convention they are all leading --
@@ -436,6 +473,76 @@ class _SubtableParser:
                 next_row_idx -= 1
 
         return tuple(reversed(list(iter_trailing_single_cell_row_indices())))
+
+
+def _cell_coordinates(rows: np.ndarray, cols: np.ndarray) -> Iterator[_CellCoordinate]:
+    """Generate `(row, col)` cell-coordinates as Python ints from parallel index arrays."""
+    return zip(rows.tolist(), cols.tolist())
+
+
+def _check_worksheet_cell_count(file_bytes: bytes, engine: str, max_cells: int) -> None:
+    """Raise `UnprocessableEntityError` when the worksheets' data-frames would exceed `max_cells`.
+
+    The count is the sum across worksheets of the `rows x columns` shape Pandas would allocate,
+    measured without materializing any cells. It raises as soon as the running total passes
+    `max_cells`, so the scan itself never reads further than needed.
+    """
+    total_cells = 0
+    cells_by_sheet: dict[int, int] = {}
+    for sheet_idx, sheet_name, n_rows, n_cols in _iter_worksheet_shapes(file_bytes, engine):
+        # -- a later shape for the same worksheet supersedes the earlier, partial one --
+        total_cells += n_rows * n_cols - cells_by_sheet.get(sheet_idx, 0)
+        cells_by_sheet[sheet_idx] = n_rows * n_cols
+        if total_cells > max_cells:
+            raise UnprocessableEntityError(
+                f"Spreadsheet exceeds the maximum of {max_cells:,} worksheet cells"
+                f" (XLSX_MAX_CELLS): worksheet '{sheet_name}' spans at least {n_rows:,} rows"
+                f" x {n_cols:,} columns."
+            )
+
+
+def _iter_worksheet_shapes(file_bytes: bytes, engine: str) -> Iterator[tuple[int, str, int, int]]:
+    """Generate `(sheet_idx, sheet_name, n_rows, n_cols)` per worksheet, as Pandas would shape it.
+
+    For XLSX the shape grows while the worksheet is streamed, so a partial shape is generated each
+    time it grows and the caller can stop early. The last shape generated for each worksheet is its
+    full shape.
+    """
+    if engine == "xlrd":
+        # -- Pandas' xlrd reader does not trim, its data-frame is exactly `nrows x ncols`. Ragged
+        # -- rows and on-demand loading keep this scan proportional to the populated cells.
+        book = xlrd.open_workbook(file_contents=file_bytes, on_demand=True, ragged_rows=True)
+        try:
+            for sheet_idx in range(book.nsheets):
+                sheet = book.sheet_by_index(sheet_idx)
+                yield sheet_idx, sheet.name, sheet.nrows, sheet.ncols
+                book.unload_sheet(sheet_idx)
+        finally:
+            book.release_resources()
+        return
+
+    # -- Load exactly as Pandas does. Its openpyxl reader ignores the stored `<dimension>` and trims
+    # -- trailing empty rows and cells, so the shape spans the last row and column with a value.
+    # -- Read-only mode streams the XML and generates rows missing from it as empty tuples, so
+    # -- the gap before a far-away cell costs next to nothing.
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(file_bytes), read_only=True, data_only=True, keep_links=False
+    )
+    try:
+        for sheet_idx, worksheet in enumerate(workbook.worksheets):
+            worksheet.reset_dimensions()  # pyright: ignore[reportAttributeAccessIssue]
+            n_rows, n_cols = 0, 0
+            for row in worksheet.iter_rows():
+                # -- the last cell in this row holding a value, if any --
+                last_cell = next((c for c in reversed(row) if c.value not in (None, "")), None)
+                if last_cell is None:
+                    continue
+                n_rows = last_cell.row
+                n_cols = max(n_cols, last_cell.column)
+                yield sheet_idx, worksheet.title, n_rows, n_cols
+            yield sheet_idx, worksheet.title, n_rows, n_cols
+    finally:
+        workbook.close()
 
 
 def _create_element(text: str) -> Element:

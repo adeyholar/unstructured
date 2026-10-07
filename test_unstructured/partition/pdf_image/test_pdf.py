@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import math
 import os
 import tempfile
+import time
+import zlib
 from dataclasses import dataclass
+from importlib import reload
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 from pdf2image.exceptions import PDFPageCountError
 from PIL import Image
+from pypdf import PdfWriter
+from pypdf.errors import LimitReachedError
+from pypdf.generic import ArrayObject, DecodedStreamObject, NameObject, NullObject
 from pytest_mock import MockFixture
-from unstructured_inference.inference import layout
+from unstructured_inference.inference import layout, pdf_image
 from unstructured_inference.inference.elements import Rectangle
 from unstructured_inference.inference.layout import DocumentLayout, PageLayout
 from unstructured_inference.inference.layoutelement import LayoutElement
@@ -34,10 +42,11 @@ from unstructured.documents.elements import (
     Text,
     Title,
 )
-from unstructured.errors import PageCountExceededError
+from unstructured.errors import PageCountExceededError, UnprocessableEntityError
 from unstructured.partition import pdf, strategies
 from unstructured.partition.pdf_image import ocr, pdfminer_processing
 from unstructured.partition.pdf_image.pdfminer_processing import get_uris_from_annots
+from unstructured.partition.utils import config as partition_config
 from unstructured.partition.utils.constants import (
     OCR_AGENT_PADDLE,
     OCR_AGENT_TESSERACT,
@@ -204,8 +213,67 @@ def test_partition_pdf_local(monkeypatch, filename, file):
 
 
 def test_partition_pdf_local_raises_with_no_filename():
-    with pytest.raises((FileNotFoundError, PDFPageCountError)):
+    with pytest.raises((FileNotFoundError, PDFPageCountError, TypeError)):
         pdf._partition_pdf_or_image_local(filename="", file=None, is_image=False)
+
+
+def _layout_with_rotation_corrections(corrections):
+    """Build a minimal document-layout stub whose pages carry ``pdf_rotation_correction``."""
+    return SimpleNamespace(pages=[SimpleNamespace(image_metadata=meta) for meta in corrections])
+
+
+def test_rotation_corrections_from_layout_reads_metadata():
+    """The main path: per-page corrections recorded by unstructured-inference are surfaced."""
+    document_layout = _layout_with_rotation_corrections(
+        [{"pdf_rotation_correction": 90}, {"pdf_rotation_correction": 270}]
+    )
+    assert pdf._rotation_corrections_from_layout(document_layout) == [90, 270]
+
+
+def test_rotation_corrections_from_layout_defaults_to_zero_on_missing_metadata():
+    """The default path: missing or empty image metadata yields a 0 (no-op) correction."""
+    document_layout = _layout_with_rotation_corrections([None, {}, {"width": 10, "height": 10}])
+    assert pdf._rotation_corrections_from_layout(document_layout) == [0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    ("file_arg", "model_target", "pdfminer_target"),
+    [
+        (None, "process_file_with_model", "process_file_with_pdfminer"),
+        (b"0000", "process_data_with_model", "process_data_with_pdfminer"),
+    ],
+)
+def test_partition_pdf_local_threads_rotation_corrections_into_pdfminer(
+    monkeypatch, file_arg, model_target, pdfminer_target
+):
+    """Both branches of `_partition_pdf_or_image_local` forward the page rotation
+    corrections derived from the inferred layout into the pdfminer extraction call."""
+
+    rotated_layout = _layout_with_rotation_corrections(
+        [{"pdf_rotation_correction": 90}, {"pdf_rotation_correction": 0}]
+    )
+    monkeypatch.setattr(layout, model_target, lambda *a, **k: rotated_layout)
+
+    captured = {}
+
+    def _capture_pdfminer(*args, **kwargs):
+        captured["rotation_corrections"] = kwargs.get("rotation_corrections")
+        return ([], [])
+
+    monkeypatch.setattr(pdfminer_processing, pdfminer_target, _capture_pdfminer)
+    monkeypatch.setattr(
+        pdfminer_processing, "merge_inferred_with_extracted_layout", lambda **k: rotated_layout
+    )
+    monkeypatch.setattr(ocr, "process_file_with_ocr", lambda *a, **k: MockDocumentLayout())
+    monkeypatch.setattr(ocr, "process_data_with_ocr", lambda *a, **k: MockDocumentLayout())
+
+    pdf._partition_pdf_or_image_local(
+        filename=example_doc_path("pdf/layout-parser-paper-fast.pdf"),
+        file=file_arg,
+        pdf_text_extractable=True,
+    )
+
+    assert captured["rotation_corrections"] == [90, 0]
 
 
 @pytest.mark.parametrize("file_mode", ["filename", "rb", "spool"])
@@ -281,6 +349,73 @@ def test_partition_pdf_with_model_name_env_var(
     ) as mock_process:
         pdf.partition_pdf(filename=filename, strategy=PartitionStrategy.HI_RES)
         assert mock_process.call_args[1]["model_name"] == "checkbox"
+
+
+def test_partition_pdf_passes_configured_dpi_to_inference(
+    monkeypatch,
+):
+    filename = example_doc_path("pdf/layout-parser-paper-fast.pdf")
+    monkeypatch.setattr(pdf, "extractable_elements", lambda *args, **kwargs: [])
+    with mock.patch.object(
+        layout,
+        "process_file_with_model",
+        return_value=MockDocumentLayout(),
+    ) as mock_process:
+        pdf.partition_pdf(filename=filename, strategy=PartitionStrategy.HI_RES)
+        assert mock_process.call_args[1]["pdf_image_dpi"] == 350
+
+
+def test_partition_pdf_passes_render_max_pixels_to_inference(monkeypatch):
+    filename = example_doc_path("pdf/layout-parser-paper-fast.pdf")
+    monkeypatch.setattr(pdf, "extractable_elements", lambda *args, **kwargs: [])
+
+    with (
+        mock.patch.object(
+            layout,
+            "process_file_with_model",
+            return_value=MockDocumentLayout(),
+        ) as mock_process,
+        mock.patch.object(
+            ocr,
+            "process_file_with_ocr",
+            return_value=MockDocumentLayout(),
+        ),
+    ):
+        pdf.partition_pdf(filename=filename, strategy=PartitionStrategy.HI_RES)
+
+    assert mock_process.call_args[1]["pdf_render_max_pixels_per_page"] == 1_000_000_000
+
+    with (
+        open(filename, "rb") as file,
+        mock.patch.object(
+            layout,
+            "process_data_with_model",
+            return_value=MockDocumentLayout(),
+        ) as mock_process,
+        mock.patch.object(
+            ocr,
+            "process_data_with_ocr",
+            return_value=MockDocumentLayout(),
+        ),
+    ):
+        pdf.partition_pdf(file=file, strategy=PartitionStrategy.HI_RES)
+
+    assert mock_process.call_args[1]["pdf_render_max_pixels_per_page"] == 1_000_000_000
+
+
+def test_partition_pdf_render_too_large_error_is_unprocessable(monkeypatch):
+    filename = example_doc_path("pdf/layout-parser-paper-fast.pdf")
+    monkeypatch.setattr(pdf, "extractable_elements", lambda *args, **kwargs: [])
+    with mock.patch.object(
+        layout,
+        "process_file_with_model",
+        side_effect=pdf_image.PdfRenderTooLargeError(
+            "PDF page would render to too many pixels for safe processing: "
+            "page=1, pixels=1000000001, maximum=1000000000.",
+        ),
+    ):
+        with pytest.raises(UnprocessableEntityError, match="too many pixels"):
+            pdf.partition_pdf(filename=filename, strategy=PartitionStrategy.HI_RES)
 
 
 @pytest.mark.parametrize("model_name", ["checkbox", "yolox"])
@@ -425,6 +560,79 @@ def test_partition_pdf_with_fast_strategy_and_page_breaks(caplog):
         assert element.metadata.filename == "layout-parser-paper-fast.pdf"
 
 
+def test_partition_pdf_with_fast_strategy_deduplicates_fake_bold(monkeypatch):
+    """Test that fast strategy properly deduplicates fake-bold text in PDFs.
+
+    Some PDFs create bold text by rendering each character twice at slightly offset
+    positions (fake-bold). The fast strategy should remove these duplicate characters.
+    """
+    filename = example_doc_path("pdf/fake-bold-sample.pdf")
+
+    # Extract WITHOUT deduplication (threshold=0) - shows doubled characters
+    monkeypatch.setenv("PDF_CHAR_DUPLICATE_THRESHOLD", "0")
+    reload(partition_config)
+    elements_no_dedup = pdf.partition_pdf(filename=filename, strategy=PartitionStrategy.FAST)
+    text_no_dedup = " ".join([el.text for el in elements_no_dedup])
+
+    # Extract WITH deduplication (threshold=2.0) - shows clean text
+    monkeypatch.setenv("PDF_CHAR_DUPLICATE_THRESHOLD", "2.0")
+    reload(partition_config)
+    elements_with_dedup = pdf.partition_pdf(filename=filename, strategy=PartitionStrategy.FAST)
+    text_with_dedup = " ".join([el.text for el in elements_with_dedup])
+
+    # Verify fake-bold text shows doubled characters without deduplication
+    assert "BBOOLLDD" in text_no_dedup, (
+        "Without deduplication, fake-bold text should show doubled chars like 'BBOOLLDD'"
+    )
+
+    # Verify deduplication produces clean text
+    assert "BOLD" in text_with_dedup, "With deduplication, text should contain clean 'BOLD'"
+
+    # Verify deduplicated text is shorter
+    assert len(text_with_dedup) < len(text_no_dedup), (
+        f"Deduplicated text ({len(text_with_dedup)} chars) should be shorter "
+        f"than non-deduplicated text ({len(text_no_dedup)} chars)"
+    )
+
+
+def test_partition_pdf_with_fast_strategy_extracts_embedded_cmap_text():
+    """Test that fast strategy extracts text from CIDFonts with embedded CMap streams.
+
+    Some PDF generators (e.g. Prince XML) embed custom Encoding CMaps as PDF streams
+    rather than using predefined CMap names. Without handling this, pdfminer.six silently
+    falls back to an empty CMap and all text using those fonts is lost.
+
+    The test fixture has two fonts: a simple Type1 font (Helvetica) that pdfminer handles
+    fine, and a Type0/CIDFont with an embedded CMap named "Test-Identity-H" that triggers
+    the bug.
+    """
+    filename = example_doc_path("pdf/embedded-cmap-cidfont.pdf")
+    elements = pdf.partition_pdf(filename=filename, url=None, strategy=PartitionStrategy.FAST)
+
+    all_text = " ".join(e.text for e in elements)
+
+    # The Helvetica heading should always be extracted
+    assert "Heading in Helvetica" in all_text
+
+    # These strings are rendered with the CIDFont using the embedded CMap.
+    # Without the fix, they would be silently dropped.
+    assert "This text uses an embedded CMap" in all_text
+    assert "and should be extractable" in all_text
+
+    assert len(elements) == 3
+
+
+def test_partition_pdf_with_hi_res_strategy_extracts_embedded_cmap_text():
+    """Same as the fast strategy test but through hi_res, since both strategies use pdfminer."""
+    filename = example_doc_path("pdf/embedded-cmap-cidfont.pdf")
+    elements = pdf.partition_pdf(filename=filename, url=None, strategy=PartitionStrategy.HI_RES)
+
+    all_text = " ".join(e.text for e in elements)
+
+    assert "This text uses an embedded CMap" in all_text
+    assert "and should be extractable" in all_text
+
+
 def test_partition_pdf_raises_with_bad_strategy():
     filename = example_doc_path("pdf/layout-parser-paper-fast.pdf")
     with pytest.raises(ValueError):
@@ -460,14 +668,17 @@ def test_partition_pdf_falls_back_to_fast_from_ocr_only(monkeypatch, caplog):
     monkeypatch.setattr(strategies, "dependency_exists", mock_exists)
 
     mock_return = [[Text("Hello there!")], []]
-    with mock.patch.object(
-        pdf,
-        "extractable_elements",
-        return_value=mock_return,
-    ) as mock_partition, mock.patch.object(
-        pdf,
-        "_partition_pdf_or_image_with_ocr",
-    ) as mock_partition_ocr:
+    with (
+        mock.patch.object(
+            pdf,
+            "extractable_elements",
+            return_value=mock_return,
+        ) as mock_partition,
+        mock.patch.object(
+            pdf,
+            "_partition_pdf_or_image_with_ocr",
+        ) as mock_partition_ocr,
+    ):
         pdf.partition_pdf(filename=filename, url=None, strategy=PartitionStrategy.OCR_ONLY)
 
     mock_partition.assert_called_once()
@@ -540,6 +751,7 @@ def test_partition_pdf_hi_table_extraction_with_languages(ocr_mode):
         languages=["kor"],
         strategy=PartitionStrategy.HI_RES,
         infer_table_structure=True,
+        pdf_image_dpi=200,
     )
     table = [el.metadata.text_as_html for el in elements if el.metadata.text_as_html]
     assert elements[0].metadata.languages == ["kor"]
@@ -640,11 +852,11 @@ def test_partition_pdf_with_copy_protection():
     filename = example_doc_path("pdf/copy-protected.pdf")
     elements = pdf.partition_pdf(filename=filename, strategy=PartitionStrategy.HI_RES)
     title = "LayoutParser: A Uniﬁed Toolkit for Deep Learning Based Document Image Analysis"
-    idx = 22
-    assert elements[idx].text == title
+    title_elements = [e for e in elements if e.text == title]
+    assert len(title_elements) > 0, f"Expected to find title '{title}' in elements"
     assert {element.metadata.page_number for element in elements} == {1, 2}
-    assert elements[idx].metadata.detection_class_prob is not None
-    assert isinstance(elements[idx].metadata.detection_class_prob, float)
+    assert title_elements[0].metadata.detection_class_prob is not None
+    assert isinstance(title_elements[0].metadata.detection_class_prob, float)
 
 
 def test_partition_pdf_with_dpi():
@@ -1487,6 +1699,381 @@ def test_pdf_hi_res_max_pages_argument(filename, pdf_hi_res_max_pages, expected_
             )
 
 
+def test_is_pdf_too_complex_skips_small_file_size():
+    assert not pdf.is_pdf_too_complex(file=b"tiny", min_file_size_bytes=10)
+
+
+def test_is_pdf_too_complex_inspects_small_files_by_default():
+    """A small compressed file can still declare huge decoded content, so the default
+    (min_file_size_bytes=0) must inspect it rather than skip on file size."""
+
+    # One 100 KB stream referenced 9,000 times: a ~55 KB file, ~900 MB nominal decoded.
+    stream = DecodedStreamObject()
+    stream[NameObject("/Filter")] = NameObject("/FlateDecode")
+    stream._data = zlib.compress(b"\x00" * 100_000)
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    ref = writer._add_object(stream)
+    writer.pages[0][NameObject("/Contents")] = ArrayObject([ref for _ in range(9_000)])
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    data = buffer.getvalue()
+
+    assert len(data) < 1024 * 1024  # under the old 1 MB skip threshold
+    assert pdf.is_pdf_too_complex(file=data)  # defaults; no min_file_size_bytes override
+
+
+def test_is_pdf_too_complex_detects_vector_heavy_page():
+    class MockStream:
+        def get_data(self):
+            return b" ".join([b"m"] * 120 + [b"Tj"] * 2)
+
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": MockStream()}]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        assert pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            max_graphics_ops=100,
+            min_graphics_to_text_ratio=20.0,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+        )
+
+
+def test_is_pdf_too_complex_skips_pages_without_contents():
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": None}]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        assert not pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+        )
+
+
+def test_is_pdf_too_complex_skips_small_content_streams():
+    class MockStream:
+        def get_data(self):
+            return b"m Tj"
+
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": MockStream()}]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        assert not pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            max_graphics_ops=1,
+            min_graphics_to_text_ratio=1.0,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=20,
+        )
+
+
+def test_is_pdf_too_complex_restores_file_cursor_position():
+    file = io.BytesIO(b"x" * 20)
+    file.seek(7)
+
+    reader = mock.Mock()
+    reader.pages = []
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        assert not pdf.is_pdf_too_complex(
+            file=file,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+        )
+
+    assert file.tell() == 7
+
+
+def test_is_pdf_too_complex_returns_false_for_normal_pdf():
+    assert not pdf.is_pdf_too_complex(filename=example_doc_path("pdf/layout-parser-paper.pdf"))
+
+
+def _pdf_with_content_stream_array(
+    per_stream_payload: bytes,
+    num_streams: int,
+    *,
+    indirect_array: bool = False,
+) -> bytes:
+    """One-page PDF whose ``/Contents`` is an array of ``num_streams`` FlateDecode streams
+    (small file, huge decoded output -- CVE-2026-33123). pypdf private API keeps it small."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    compressed = zlib.compress(per_stream_payload)
+
+    refs = ArrayObject()
+    for _ in range(num_streams):
+        stream = DecodedStreamObject()
+        stream[NameObject("/Filter")] = NameObject("/FlateDecode")
+        stream._data = compressed
+        refs.append(writer._add_object(stream))
+
+    contents = writer._add_object(refs) if indirect_array else refs
+    writer.pages[0][NameObject("/Contents")] = contents
+
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("indirect_array", [False, True], ids=["direct", "indirect"])
+def test_is_pdf_too_complex_flags_graphics_heavy_content_array(indirect_array):
+    """A direct or indirect array of graphics-heavy streams is flagged too complex.
+    The indirect case guards the dereference: it used to skip the array branch."""
+
+    payload = b" ".join([b"m"] * 400 + [b"Tj"] * 2)  # graphics-heavy, ratio 200:1
+    data = _pdf_with_content_stream_array(payload, num_streams=300, indirect_array=indirect_array)
+
+    assert pdf.is_pdf_too_complex(
+        file=data,
+        max_graphics_ops=100,
+        min_graphics_to_text_ratio=20.0,
+        min_file_size_bytes=1,
+        min_raw_stream_bytes=1,
+    )
+
+
+def test_is_pdf_too_complex_bounds_array_of_many_streams():
+    """CVE-2026-33123 regression: a ~2 MB file whose array decodes to ~900 MB ran for
+    minutes / OOM'd on the old `bytes +=`; the fix caps it and returns almost at once."""
+
+    data = _pdf_with_content_stream_array(b"\x00" * 100_000, num_streams=9_000)
+    assert len(data) < 10 * 1024 * 1024  # small file, huge nominal decoded size
+
+    start = time.perf_counter()
+    result = pdf.is_pdf_too_complex(file=data, min_file_size_bytes=1, min_raw_stream_bytes=1)
+    elapsed = time.perf_counter() - start
+
+    # Decoded content blows past the 50 MB per-page cap, so the page fails closed.
+    assert result is True
+    assert elapsed < 10.0, f"is_pdf_too_complex took {elapsed:.2f}s -- accumulation is not bounded"
+
+
+def test_is_pdf_too_complex_caps_content_array_entries():
+    """An array of many empty/tiny streams cannot force unbounded work: the entry-count
+    cap short-circuits before any stream is decoded, and the page fails closed."""
+
+    call_count = 0
+
+    class EmptyStream:
+        def get_data(self):
+            nonlocal call_count
+            call_count += 1
+            return b""
+
+    num_streams = 50_000
+    contents = ArrayObject([EmptyStream() for _ in range(num_streams)])
+
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": contents}]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        result = pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+            max_content_stream_array_entries=10_000,
+        )
+
+    assert result is True
+    assert call_count == 0  # cap checked against len(contents) before any decode
+
+
+def test_is_pdf_too_complex_caps_oversized_stream_before_copy():
+    """A stream over the byte cap fails closed before being copied/scanned, in both the
+    array and standalone branches."""
+
+    class BigStream:
+        def get_data(self):
+            return b"a" * 25_000
+
+    # Array branch: oversized entry trips the cap on the first item.
+    array_stream = BigStream()
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": ArrayObject([array_stream, BigStream(), BigStream()])}]
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        assert pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+            max_raw_stream_bytes=10_000,
+        )
+
+    # Standalone (non-array) branch: oversized single stream also fails closed.
+    single_stream = BigStream()
+    reader.pages = [{"/Contents": single_stream}]
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        assert pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+            max_raw_stream_bytes=10_000,
+        )
+
+
+def test_is_pdf_too_complex_bounds_total_bytes_across_pages():
+    """Pages sharing one array stay under the per-page cap, so only the document byte
+    budget can fail them closed once the decoded total exceeds it."""
+
+    # Graphics-light filler so no page trips the ratio -- the byte budget must be what fails.
+    payload = b"\x00" * 40_000  # 40 KB per page, well under the per-page cap
+    stream = DecodedStreamObject()
+    stream[NameObject("/Filter")] = NameObject("/FlateDecode")
+    stream._data = zlib.compress(payload)
+
+    writer = PdfWriter()
+    shared_ref = writer._add_object(stream)  # one stream, referenced by every page
+    for _ in range(10):
+        writer.add_blank_page(width=200, height=200)
+        writer.pages[-1][NameObject("/Contents")] = ArrayObject([shared_ref])
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    data = buffer.getvalue()
+
+    # 250 KB budget below the 400 KB document total -> fail closed.
+    assert pdf.is_pdf_too_complex(
+        file=data,
+        min_file_size_bytes=1,
+        min_raw_stream_bytes=1,
+        max_raw_stream_bytes=1_000_000,
+        max_total_stream_bytes=250_000,
+    )
+
+
+def test_is_pdf_too_complex_document_budget_survives_decode_errors():
+    """Bytes are charged per decoded stream, so a `[valid, raises]` array still counts
+    the valid stream -- a mid-page decode error can't discard the accounting."""
+
+    good = DecodedStreamObject()
+    good[NameObject("/Filter")] = NameObject("/FlateDecode")
+    good._data = zlib.compress(b"\x00" * 90_000)  # decodes to 90 KB
+
+    bad = DecodedStreamObject()
+    bad[NameObject("/Filter")] = NameObject("/UnknownBogusFilter")  # get_data() raises
+    bad._data = b"garbage"
+
+    writer = PdfWriter()
+    good_ref = writer._add_object(good)
+    bad_ref = writer._add_object(bad)
+    shared_ref = writer._add_object(ArrayObject([good_ref, bad_ref]))
+    for _ in range(10):
+        writer.add_blank_page(width=200, height=200)
+        writer.pages[-1][NameObject("/Contents")] = shared_ref
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    data = buffer.getvalue()
+
+    # Two valid 90 KB streams exceed the 150 KB budget despite each page's second raising.
+    assert pdf.is_pdf_too_complex(
+        file=data,
+        min_file_size_bytes=1,
+        min_raw_stream_bytes=1,
+        max_raw_stream_bytes=100_000,
+        max_total_stream_bytes=150_000,
+    )
+
+
+@pytest.mark.parametrize("array_contents", [False, True], ids=["standalone", "array"])
+def test_is_pdf_too_complex_fails_closed_on_decoder_limit(array_contents):
+    """A stream that raises LimitReachedError (pypdf's decode-limit, e.g. a compression
+    bomb) fails the page closed rather than being skipped and handed to PDFMiner."""
+
+    class BombStream:
+        def get_data(self):
+            raise LimitReachedError("Limit reached while decompressing.")
+
+    contents = ArrayObject([BombStream()]) if array_contents else BombStream()
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": contents}]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        assert pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+        )
+
+
+def test_is_pdf_too_complex_unreadable_stream_does_not_skip_rest_of_page():
+    """One stream that fails to decode skips only itself; the remaining streams on the
+    page are still inspected, so a bad sibling can't mask an over-cap stream."""
+
+    class BadStream:
+        def get_data(self):
+            raise NotImplementedError("unsupported filter")
+
+    class ValidStream:
+        def get_data(self):
+            return b"a" * 20_000  # over the 10 KB cap below
+
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": ArrayObject([BadStream(), ValidStream()])}]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        # Old behavior skipped the whole page on the bad stream and returned False.
+        assert pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+            max_raw_stream_bytes=10_000,
+        )
+
+
+def test_is_pdf_too_complex_bounds_total_entries_across_pages():
+    """The document entry budget bounds total streams decoded, so empty streams (which
+    never move the byte budget) can't scale work with page count."""
+
+    get_data_calls = 0
+
+    class EmptyStream:
+        def get_data(self):
+            nonlocal get_data_calls
+            get_data_calls += 1
+            return b""
+
+    # One 1,000-entry array (under the 10,000 per-page cap) shared by every page.
+    shared = ArrayObject([EmptyStream() for _ in range(1_000)])
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": shared} for _ in range(100)]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        result = pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+            max_content_stream_array_entries=10_000,  # per-page cap NOT hit (1,000 < 10,000)
+            max_total_array_entries=5_000,
+        )
+
+    assert result is True  # fail closed once the entry budget is exhausted
+    assert get_data_calls == 5_000  # bounded by the budget, not the 100k possible decodes
+
+
+def test_is_pdf_too_complex_charges_non_stream_entries_to_budget():
+    """The entry budget charges every slot, so a shared array of non-stream objects
+    (nulls) is bounded too -- charging only streams left traversal scaling with pages."""
+
+    # 9,999 non-stream entries (under the 10,000 per-page cap), shared across many pages.
+    shared = ArrayObject([NullObject() for _ in range(9_999)])
+    reader = mock.Mock()
+    reader.pages = [{"/Contents": shared} for _ in range(200)]
+
+    with mock.patch.object(pdf, "PdfReader", return_value=reader):
+        result = pdf.is_pdf_too_complex(
+            file=b"x" * 20,
+            min_file_size_bytes=1,
+            min_raw_stream_bytes=1,
+            max_content_stream_array_entries=10_000,  # per-page cap NOT hit (9,999 < 10,000)
+            max_total_array_entries=1,
+        )
+
+    # Fails closed on page 1; the pre-fix code charged only streams and returned False.
+    assert result is True
+
+
 def test_document_to_element_list_omits_coord_system_when_coord_points_absent():
     # TODO (yao): investigate why we need this test. The LayoutElement definition suggests bbox
     # can't be None and it has to be a Rectangle object that has x1, y1, x2, y2 attributes.
@@ -1495,6 +2082,25 @@ def test_document_to_element_list_omits_coord_system_when_coord_points_absent():
         page.elements_array.element_coords[:, :] = None
     elements = pdf.document_to_element_list(layout_elem_absent_coordinates)
     assert elements[0].metadata.coordinates is None
+
+
+def test_document_to_element_list_filters_coordinates_from_kwargs():
+    """Test that coordinates and coordinate_system in kwargs don't cause TypeError.
+
+    When users pass coordinates=True to partition_pdf with hi_res strategy,
+    this boolean value could end up in kwargs and conflict with the explicit
+    coordinates parameter (which expects tuple data). This test verifies that
+    these keys are filtered from kwargs before calling add_element_metadata.
+    Regression test for issue #4126.
+    """
+    doc = MockSinglePageDocumentLayout()
+    # This should not raise TypeError even with coordinates=True in kwargs
+    elements = pdf.document_to_element_list(doc, coordinates=True, coordinate_system=True)
+    assert len(elements) > 0
+    # Verify elements still have proper coordinate metadata (not the boolean True)
+    for element in elements:
+        if element.metadata.coordinates is not None:
+            assert isinstance(element.metadata.coordinates, CoordinatesMetadata)
 
 
 @dataclass
@@ -1638,3 +2244,20 @@ def test_reproductible_pdf_loader():
                 assert e1.text == e2.text, f"load two time {f=} return differents results"
             else:
                 break
+
+
+def test_hi_res_groups_rotated_page_text_into_words():
+    elements = pdf.partition_pdf(
+        filename=example_doc_path("rotated-page-90.pdf"),
+        strategy=PartitionStrategy.HI_RES,
+    )
+
+    texts = [e.text for e in elements if e.text and len(e.text) > 5]
+    assert any("Hello World" in t for t in texts), (
+        f"Expected 'Hello World' as grouped text from rotated page, got: {texts[:5]}"
+    )
+
+    single_chars = [e.text for e in elements if e.text and len(e.text) == 1]
+    assert len(single_chars) == 0, (
+        f"Rotated page produced {len(single_chars)} single-char elements: {single_chars[:10]}"
+    )

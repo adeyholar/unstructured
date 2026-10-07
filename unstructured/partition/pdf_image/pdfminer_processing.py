@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import TYPE_CHECKING, Any, BinaryIO, Iterable, List, Optional, Union, cast
 
 import numpy as np
-from pdfminer.layout import LTChar, LTTextBox
+from pdfminer.layout import LAParams, LTChar, LTContainer, LTTextBox
 from pdfminer.pdftypes import PDFObjRef
-from pdfminer.utils import open_filename
+from pdfminer.utils import decode_text, open_filename
 from unstructured_inference.config import inference_config
-from unstructured_inference.constants import FULL_PAGE_REGION_THRESHOLD
+from unstructured_inference.constants import FULL_PAGE_REGION_THRESHOLD, IsExtracted
 from unstructured_inference.inference.elements import Rectangle
 
 from unstructured.documents.coordinates import PixelSpace, PointSpace
@@ -16,8 +17,10 @@ from unstructured.documents.elements import CoordinatesMetadata, ElementType
 from unstructured.partition.pdf_image.pdf_image_utils import remove_control_characters
 from unstructured.partition.pdf_image.pdfminer_utils import (
     PDFMinerConfig,
+    _is_duplicate_char,
     extract_image_objects,
     extract_text_objects,
+    get_text_with_deduplication,
     open_pdfminer_pages_generator,
     rect_to_bbox,
 )
@@ -39,16 +42,43 @@ DEFAULT_ROUND = 15
 
 def process_file_with_pdfminer(
     filename: str = "",
-    dpi: int = 200,
+    dpi: int = env_config.PDF_RENDER_DPI,
     password: Optional[str] = None,
     pdfminer_config: Optional[PDFMinerConfig] = None,
+    rotation_corrections: Optional[List[int]] = None,
 ) -> tuple[List[List["TextRegion"]], List[List]]:
     with open_filename(filename, "rb") as fp:
         fp = cast(BinaryIO, fp)
         extracted_layout, layouts_links = process_data_with_pdfminer(
-            file=fp, dpi=dpi, password=password, pdfminer_config=pdfminer_config
+            file=fp,
+            dpi=dpi,
+            password=password,
+            pdfminer_config=pdfminer_config,
+            rotation_corrections=rotation_corrections,
         )
         return extracted_layout, layouts_links
+
+
+def _rotate_bboxes(coords: np.ndarray, angle: int, width: float, height: float) -> np.ndarray:
+    """Rotate bounding boxes to mirror a rendered page image that was rotated ``angle``
+    degrees counter-clockwise (PIL convention) with ``expand=True``.
+
+    ``width``/``height`` are the page-image dimensions in the un-rotated (display) frame.
+    unstructured-inference may rotate a page image to make its dominant text upright;
+    applying the same rotation here keeps the pdfminer layer aligned with the
+    object-detection layer so the two merge correctly.
+    """
+    angle %= 360
+    if angle == 0 or coords.size == 0:
+        return coords
+    x1, y1, x2, y2 = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+    if angle == 90:
+        return np.column_stack((y1, width - x2, y2, width - x1))
+    if angle == 180:
+        return np.column_stack((width - x2, height - y2, width - x1, height - y1))
+    if angle == 270:
+        return np.column_stack((height - y2, x1, height - y1, x2))
+    return coords
 
 
 def _validate_bbox(bbox: list[int | float]) -> bool:
@@ -57,14 +87,20 @@ def _validate_bbox(bbox: list[int | float]) -> bool:
 
 def _minimum_containing_coords(*regions: TextRegions) -> np.ndarray:
     # TODO: refactor to just use np array as input
-    return np.vstack(
+    # Optimization: Use np.stack and np.column_stack to build output in a single step
+    x1s = np.array([region.x1 for region in regions])
+    y1s = np.array([region.y1 for region in regions])
+    x2s = np.array([region.x2 for region in regions])
+    y2s = np.array([region.y2 for region in regions])
+    # Use np.min/max reduction rather than create matrix then operate.
+    return np.column_stack(
         (
-            np.min([region.x1 for region in regions], axis=0),
-            np.min([region.y1 for region in regions], axis=0),
-            np.max([region.x2 for region in regions], axis=0),
-            np.max([region.y2 for region in regions], axis=0),
+            np.min(x1s, axis=0),
+            np.min(y1s, axis=0),
+            np.max(x2s, axis=0),
+            np.max(y2s, axis=0),
         )
-    ).T
+    )
 
 
 def _inferred_is_elementtype(
@@ -120,7 +156,7 @@ def _merge_extracted_into_inferred_when_almost_the_same(
         inferred_layout.element_coords,
         threshold=same_region_threshold,
     )
-    extracted_almost_the_same_as_inferred = boxes_almost_same.sum(axis=1).astype(bool)
+    extracted_almost_the_same_as_inferred = np.any(boxes_almost_same, axis=1)
     # NOTE: if a row is full of False the argmax returns first index; we use the mask above to
     # distinguish those (they would be False in the mask)
     first_match = np.argmax(boxes_almost_same, axis=1)
@@ -128,6 +164,9 @@ def _merge_extracted_into_inferred_when_almost_the_same(
     extracted_to_remove = extracted_layout.slice(extracted_almost_the_same_as_inferred)
     # copy here in case we change the extracted layout later
     inferred_layout.texts[inferred_indices_to_update] = extracted_to_remove.texts.copy()
+    inferred_layout.is_extracted_array[inferred_indices_to_update] = (
+        extracted_to_remove.is_extracted_array.copy()
+    )
     # use coords that can bound BOTH the inferred and extracted region as final bounding box coords
     inferred_layout.element_coords[inferred_indices_to_update] = _minimum_containing_coords(
         inferred_layout.slice(inferred_indices_to_update),
@@ -337,7 +376,7 @@ def array_merge_inferred_layout_with_extracted_layout(
     extracted_to_keep = np.concatenate(
         (image_indices_to_keep, text_element_indices[extracted_to_proc])
     )
-    if any(extracted_to_keep):
+    if extracted_to_keep.size:
         inferred_to_proc = np.logical_or(
             inferred_to_proc,
             _inferred_is_elementtype(
@@ -371,6 +410,59 @@ def array_merge_inferred_layout_with_extracted_layout(
     return final_layout
 
 
+def _ltchar_is_rotated(char: LTChar) -> bool:
+    # Calculate rotation angle in degrees
+    # For standard text: a=1, b=0, c=0, d=1 (no rotation)
+    rotation_radians = math.atan2(char.matrix[1], char.matrix[0])
+    # 0.001 is the tolerance for nearly flat angles; mainly for handling numerical precision
+    return abs(rotation_radians) > 0.001
+
+
+def text_is_embedded(obj, threshold=env_config.PDF_MAX_EMBED_LOW_FIDELITY_TEXT_RATIO):
+    """Check if text object contains too many low_fidelity text: invisible or rotated
+
+    Low fidelity text means that even though the text is extracted from pdf data but its
+    representation in the partitioned elements may require post processing to make senmatic sense.
+    This includes:
+      - invisible text: text not rendered on the pdf are not present visually when reading the page
+        so those texts may not be high quality information for understanding the page
+      - rotated text: text rotated usually are extracted in the order they appear in the dominant
+        reading order of the page (e.g., left->right, top->down). But if a text is rotated so the
+        last character is at the top (y position) and first character is at the bottom the extracted
+        element would contain words written in reverse order. This makes the extraction low quality.
+    """
+    low_fidelity_chars = 0
+    total_chars = 0
+
+    def extract_chars(layout_obj):
+        """Recursively extract all LTChar objects from layout."""
+        nonlocal low_fidelity_chars, total_chars
+
+        if isinstance(layout_obj, LTChar):
+            total_chars += 1
+
+            # Check if text is low_fidelity:
+            #  - rendering mode 3 (requires custom pdf interpreter comes with this library)
+            #  - text is rotated
+            if (
+                hasattr(layout_obj, "rendermode") and layout_obj.rendermode == 3
+            ) or _ltchar_is_rotated(layout_obj):
+                low_fidelity_chars += 1
+        elif isinstance(layout_obj, LTContainer):
+            # Recursively process container's children
+            for child in layout_obj:
+                extract_chars(child)
+
+    extract_chars(obj)
+    if total_chars > 0:
+        # when there are no-trivial amount of hidden characters in the object it means there are
+        # text that is not rendered -> most likely OCR'ed text for the image content overlying the
+        # text and not embedded text that also shows in the rendered pdf
+        low_fidelity_ratio = low_fidelity_chars / total_chars
+        return low_fidelity_ratio < threshold
+    return True
+
+
 @requires_dependencies("unstructured_inference")
 def process_page_layout_from_pdfminer(
     annotation_list: list,
@@ -378,11 +470,14 @@ def process_page_layout_from_pdfminer(
     page_height: int | float,
     page_number: int,
     coord_coef: float,
+    pdfminer_config: Optional[PDFMinerConfig] = None,
+    widget_list: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[LayoutElements, list]:
     from unstructured_inference.inference.layoutelement import LayoutElements
 
     urls_metadata: list[dict[str, Any]] = []
     element_coords, texts, element_class = [], [], []
+    is_extracted = []
     annotation_threshold = env_config.PDF_ANNOTATION_THRESHOLD
 
     for obj in page_layout:
@@ -402,13 +497,16 @@ def process_page_layout_from_pdfminer(
 
         if hasattr(obj, "get_text"):
             inner_text_objects = extract_text_objects(obj)
+            char_dedup_threshold = env_config.PDF_CHAR_DUPLICATE_THRESHOLD
             for inner_obj in inner_text_objects:
                 inner_bbox = rect_to_bbox(inner_obj.bbox, page_height)
                 if not _validate_bbox(inner_bbox):
                     continue
-                texts.append(inner_obj.get_text())
+                # Use deduplication to handle fake bold text (characters rendered twice)
+                texts.append(get_text_with_deduplication(inner_obj, char_dedup_threshold))
                 element_coords.append(inner_bbox)
                 element_class.append(0)
+                is_extracted.append(IsExtracted.TRUE if text_is_embedded(inner_obj) else None)
         else:
             inner_image_objects = extract_image_objects(obj)
             for img_obj in inner_image_objects:
@@ -418,6 +516,40 @@ def process_page_layout_from_pdfminer(
                 texts.append(None)
                 element_coords.append(inner_bbox)
                 element_class.append(1)
+                is_extracted.append(None)
+            # A container without a `get_text` method (e.g. an `LTFigure` overlay) can still hold
+            # real, rendered text as loose `LTChar`s -- for example text drawn into a figure/XObject
+            # overlay rather than the main content stream -- which `extract_text_objects`
+            # (LTTextLine only) misses. Re-run pdfminer layout analysis on the container, reusing
+            # the same LAParams settings as the main pass plus `all_texts=True`, so those characters
+            # are grouped into `LTTextLine`s, then extract them through the same path as the main
+            # text branch above.
+            if isinstance(obj, LTContainer):
+                laparams_kwargs = (
+                    pdfminer_config.model_dump(exclude_none=True) if pdfminer_config else {}
+                )
+                laparams_kwargs["all_texts"] = True
+                obj.analyze(LAParams(**laparams_kwargs))
+                char_dedup_threshold = env_config.PDF_CHAR_DUPLICATE_THRESHOLD
+                for inner_obj in extract_text_objects(obj):
+                    inner_bbox = rect_to_bbox(inner_obj.bbox, page_height)
+                    if not _validate_bbox(inner_bbox):
+                        continue
+                    texts.append(get_text_with_deduplication(inner_obj, char_dedup_threshold))
+                    element_coords.append(inner_bbox)
+                    element_class.append(0)
+                    is_extracted.append(IsExtracted.TRUE if text_is_embedded(inner_obj) else None)
+
+    # Filled AcroForm field values live in widget annotations rather than the content
+    # stream, so add them here as extracted text regions (see get_widget_text_from_annots).
+    for widget in widget_list or []:
+        widget_bbox = widget["bbox"]
+        if not _validate_bbox(widget_bbox):
+            continue
+        texts.append(widget["text"])
+        element_coords.append(widget_bbox)
+        element_class.append(0)
+        is_extracted.append(IsExtracted.TRUE)
 
     return (
         LayoutElements(
@@ -426,6 +558,7 @@ def process_page_layout_from_pdfminer(
             element_class_ids=np.array(element_class),
             element_class_id_map={0: ElementType.UNCATEGORIZED_TEXT, 1: ElementType.IMAGE},
             sources=np.array([Source.PDFMINER] * len(element_class)),
+            is_extracted_array=np.array(is_extracted),
         ),
         urls_metadata,
     )
@@ -434,12 +567,19 @@ def process_page_layout_from_pdfminer(
 @requires_dependencies("unstructured_inference")
 def process_data_with_pdfminer(
     file: Optional[Union[bytes, BinaryIO]] = None,
-    dpi: int = 200,
+    dpi: int = env_config.PDF_RENDER_DPI,
     password: Optional[str] = None,
     pdfminer_config: Optional[PDFMinerConfig] = None,
+    rotation_corrections: Optional[List[int]] = None,
 ) -> tuple[List[LayoutElements], List[List]]:
     """Loads the image and word objects from a pdf using pdfplumber and the image renderings of the
-    pdf pages using pdf2image"""
+    pdf pages using pdf2image
+
+    ``rotation_corrections`` is an optional per-page list of extra rotations (degrees,
+    counter-clockwise) that unstructured-inference applied to the rendered page images to
+    make their text upright. Mirroring those rotations onto the extracted coordinates keeps
+    the pdfminer layer aligned with the object-detection layer.
+    """
 
     from unstructured_inference.inference.layoutelement import LayoutElements
 
@@ -453,26 +593,46 @@ def process_data_with_pdfminer(
         width, height = page_layout.width, page_layout.height
 
         annotation_list = []
+        widget_list = []
         coordinate_system = PixelSpace(
             width=width,
             height=height,
         )
         if page.annots:
             annotation_list = get_uris(page.annots, height, coordinate_system, page_number)
+            widget_list = get_widget_text_from_annots(page.annots, height)
 
         layout, urls_metadata = process_page_layout_from_pdfminer(
-            annotation_list, page_layout, height, page_number, coef
+            annotation_list, page_layout, height, page_number, coef, pdfminer_config, widget_list
         )
 
-        links = [
-            {
-                "bbox": [x * coef for x in metadata["bbox"]],
-                "text": metadata["text"],
-                "url": metadata["uri"],
-                "start_index": metadata["start_index"],
-            }
-            for metadata in urls_metadata
-        ]
+        # Mirror any image rotation unstructured-inference applied for this page so the
+        # extracted coordinates share the object-detection layer's frame (see _rotate_bboxes).
+        angle = (
+            rotation_corrections[page_number]
+            if rotation_corrections is not None and page_number < len(rotation_corrections)
+            else 0
+        )
+        if angle:
+            layout.element_coords = _rotate_bboxes(
+                layout.element_coords, angle, width * coef, height * coef
+            )
+
+        links = []
+        for metadata in urls_metadata:
+            bbox = [x * coef for x in metadata["bbox"]]
+            if angle:
+                bbox = _rotate_bboxes(
+                    np.array([bbox], dtype=float), angle, width * coef, height * coef
+                )[0].tolist()
+            links.append(
+                {
+                    "bbox": bbox,
+                    "text": metadata["text"],
+                    "url": metadata["uri"],
+                    "start_index": metadata["start_index"],
+                }
+            )
 
         clean_layouts = []
         for threshold, element_class in zip(
@@ -580,7 +740,9 @@ def boxes_iou(
     inter_area, boxa_area, boxb_area = areas_of_boxes_and_intersection_area(
         coords1, coords2, round_to=round_to
     )
-    return (inter_area / np.maximum(EPSILON_AREA, boxa_area + boxb_area.T - inter_area)) > threshold
+    denom = np.maximum(EPSILON_AREA, boxa_area + boxb_area.T - inter_area)
+    # Instead of (x/y) > t, use x > t*y for memory & speed with same result
+    return inter_area > (threshold * denom)
 
 
 @requires_dependencies("unstructured_inference")
@@ -647,13 +809,18 @@ def merge_inferred_with_extracted_layout(
         merged_layout = sort_text_regions(merged_layout, SORT_MODE_BASIC)
         # so that we can modify the text without worrying about hitting length limit
         merged_layout.texts = merged_layout.texts.astype(object)
-
+        merged_layout.is_extracted_array = merged_layout.is_extracted_array.astype(object)
         for i, text in enumerate(merged_layout.texts):
             if text is None:
-                text = aggregate_embedded_text_by_block(
+                text, is_extracted = aggregate_embedded_text_by_block(
                     target_region=merged_layout.slice([i]),
                     source_regions=extracted_page_layout,
                 )
+                if merged_layout.element_class_id_map[merged_layout.element_class_ids[i]] not in (
+                    "Image",
+                    "Picture",
+                ):
+                    merged_layout.is_extracted_array[i] = is_extracted
             merged_layout.texts[i] = remove_control_characters(text)
 
         inferred_page.elements_array = merged_layout
@@ -703,37 +870,80 @@ def remove_duplicate_elements(
     # experiments show 2e3 is the block size that constrains the peak memory around 1Gb for this
     # function; that accounts for all the intermediate matricies allocated and memory for storing
     # final results
-    memory_cap_in_gb = os.getenv("UNST_MATMUL_MEMORY_CAP_IN_GB", 1)
+    memory_cap_in_gb = float(os.getenv("UNST_MATMUL_MEMORY_CAP_IN_GB", 1))
+    if memory_cap_in_gb <= 0:
+        raise ValueError("UNST_MATMUL_MEMORY_CAP_IN_GB must be > 0")
     n_split = np.ceil(coords.shape[0] / 2e3 / memory_cap_in_gb)
     splits = np.array_split(coords, n_split, axis=0)
 
-    ious = [~np.triu(boxes_iou(split, coords, threshold), k=1).any(axis=1) for split in splits]
-    return elements.slice(np.concatenate(ious))
+    # A box is dropped only when it near-duplicates a *later* box (higher global index) -- the
+    # strict upper triangle of the full IoU matrix. Each split is a contiguous block of rows
+    # compared against all coords, so the triangle's diagonal must be offset by the split's
+    # global start index; otherwise rows in later splits match themselves (and earlier boxes)
+    # and get wrongly removed, decimating dense pages (> 2000 elements).
+    keep_masks = []
+    offset = 0
+    for split in splits:
+        iou = boxes_iou(split, coords, threshold)
+        keep_masks.append(~np.triu(iou, k=1 + offset).any(axis=1))
+        offset += split.shape[0]
+    return elements.slice(np.concatenate(keep_masks))
+
+
+def _aggregated_iou(box1s, box2):
+    intersection = 0.0
+    sum_areas = calculate_bbox_area(box2)
+
+    for i in range(box1s.shape[0]):
+        intersection += calculate_intersection_area(box1s[i, :], box2)
+        sum_areas += calculate_bbox_area(box1s[i, :])
+
+    union = sum_areas - intersection
+
+    if union == 0:
+        return 1.0
+    return intersection / union
 
 
 def aggregate_embedded_text_by_block(
     target_region: TextRegions,
     source_regions: TextRegions,
-    threshold: float = env_config.EMBEDDED_TEXT_AGGREGATION_SUBREGION_THRESHOLD,
-) -> str:
+    subregion_threshold: float = env_config.EMBEDDED_TEXT_AGGREGATION_SUBREGION_THRESHOLD,
+    text_coverage_threshold: float = env_config.TEXT_COVERAGE_THRESHOLD,
+) -> tuple[str, IsExtracted | None]:
     """Extracts the text aggregated from the elements of the given layout that lie within the given
     block."""
 
     if len(source_regions) == 0 or len(target_region) == 0:
-        return ""
+        return "", None
 
     mask = (
         bboxes1_is_almost_subregion_of_bboxes2(
             source_regions.element_coords,
             target_region.element_coords,
-            threshold,
+            subregion_threshold,
         )
         .sum(axis=1)
         .astype(bool)
     )
 
     text = " ".join([text for text in source_regions.slice(mask).texts if text])
-    return text
+
+    if sum(mask):
+        source_bboxes = source_regions.slice(mask).element_coords
+        target_bboxes = target_region.element_coords
+
+        iou = _aggregated_iou(source_bboxes, target_bboxes[0, :])
+
+        fully_filled = (
+            all(flag == IsExtracted.TRUE for flag in source_regions.slice(mask).is_extracted_array)
+            and iou > text_coverage_threshold
+        )
+        is_extracted = IsExtracted.TRUE if fully_filled else IsExtracted.PARTIAL
+    else:
+        # if nothing is sliced then it is not extracted
+        is_extracted = IsExtracted.FALSE
+    return text, is_extracted
 
 
 def get_links_in_element(page_links: list, region: Rectangle) -> list:
@@ -865,6 +1075,99 @@ def try_resolve(annot: PDFObjRef):
         return annot
 
 
+def _decode_scalar_field_value(value: Any) -> Optional[str]:
+    """Decode a single AcroForm field value into text.
+
+    PDF text strings may be UTF-16 or PDFDocEncoded; choice-field export values can
+    arrive as name objects (PSLiteral).
+    """
+    if isinstance(value, bytes):
+        return decode_text(value)
+    if isinstance(value, str):
+        return value
+    name = getattr(value, "name", None)  # PSLiteral (e.g. choice export value)
+    if isinstance(name, bytes):
+        return name.decode("utf-8", "replace")
+    if isinstance(name, str):
+        return name
+    return None
+
+
+def _decode_field_value(value: Any) -> Optional[str]:
+    """Decode an AcroForm field value into text."""
+    value = try_resolve(value)
+    if isinstance(value, (list, tuple)):
+        decoded_values = [
+            text.strip()
+            for item in value
+            if (text := _decode_scalar_field_value(try_resolve(item))) and text.strip()
+        ]
+        return "\n".join(decoded_values) if decoded_values else None
+    return _decode_scalar_field_value(value)
+
+
+def get_widget_text_from_annots(
+    annots: PDFObjRef | list[PDFObjRef],
+    height: float,
+) -> list[dict[str, Any]]:
+    """Extract text from filled AcroForm widget annotations (fillable form fields).
+
+    pdfminer's page layout only covers the page content stream, so values typed into
+    fillable form fields are invisible to the normal text pass -- they live in widget
+    annotation objects (``/Annots``), not in the content stream. This recovers the value
+    text and bounding box for text (``/Tx``) and choice (``/Ch``) fields so they can be
+    emitted as elements alongside the content-stream text.
+
+    Returns a list of ``{"text", "bbox"}`` dicts, where ``bbox`` is ``(x1, y1, x2, y2)``
+    in the top-left page coordinate frame (same as ``rect_to_bbox``).
+    """
+    resolved = annots if isinstance(annots, list) else try_resolve(annots)
+    if not isinstance(resolved, list):
+        return []
+
+    results: list[dict[str, Any]] = []
+    for annotation in resolved:
+        annotation_dict = try_resolve(annotation)
+        if not isinstance(annotation_dict, dict):
+            continue
+        if getattr(annotation_dict.get("Subtype"), "name", None) != "Widget":
+            continue
+
+        # Field type (FT) and value (V) may be inherited from a parent field node, so walk
+        # up the hierarchy until both are found (bounded to avoid cycles).
+        field_type = annotation_dict.get("FT")
+        value = annotation_dict.get("V")
+        parent = annotation_dict.get("Parent")
+        seen = 0
+        while (field_type is None or value is None) and parent is not None and seen < 32:
+            parent_dict = try_resolve(parent)
+            seen += 1
+            if not isinstance(parent_dict, dict):
+                break
+            field_type = field_type or parent_dict.get("FT")
+            value = value or parent_dict.get("V")
+            parent = parent_dict.get("Parent")
+
+        if getattr(field_type, "name", None) not in ("Tx", "Ch"):
+            continue
+
+        text = _decode_field_value(value)
+        if not text or not text.strip():
+            continue
+
+        rect = annotation_dict.get("Rect")
+        if not rect or isinstance(rect, PDFObjRef) or len(rect) != 4:
+            continue
+        try:
+            bbox = rect_to_bbox(tuple(float(v) for v in rect), height)
+        except (TypeError, ValueError):
+            continue
+
+        results.append({"text": text.strip(), "bbox": bbox})
+
+    return results
+
+
 def check_annotations_within_element(
     annotation_list: list[dict[str, Any]],
     element_bbox: tuple[float, float, float, float],
@@ -901,6 +1204,33 @@ def check_annotations_within_element(
     return annotations_within_element
 
 
+def _deduplicate_ltchars(
+    chars: list[LTChar],
+    threshold: float,
+) -> list[LTChar]:
+    """Remove duplicate characters caused by fake bold rendering.
+
+    Some PDFs create bold text by rendering the same character twice at slightly offset
+    positions. This function removes such duplicates.
+
+    Args:
+        chars: List of LTChar objects to deduplicate.
+        threshold: Maximum pixel distance to consider characters as duplicates.
+                   Set to 0 to disable deduplication.
+
+    Returns:
+        Deduplicated list of LTChar objects.
+    """
+    if threshold <= 0 or not chars:
+        return chars
+
+    result = [chars[0]]
+    for char in chars[1:]:
+        if not _is_duplicate_char(result[-1], char, threshold):
+            result.append(char)
+    return result
+
+
 def get_words_from_obj(
     obj: LTTextBox,
     height: float,
@@ -921,13 +1251,25 @@ def get_words_from_obj(
     characters = []
     words = []
     text_len = 0
+    char_dedup_threshold = env_config.PDF_CHAR_DUPLICATE_THRESHOLD
 
     for text_line in obj:
         word = ""
         x1, y1, x2, y2 = None, None, None, None
         start_index = 0
+        last_char: LTChar | None = None  # Track last character for deduplication
+
         for index, character in enumerate(text_line):
             if isinstance(character, LTChar):
+                # Skip duplicate characters (fake bold fix)
+                if (
+                    char_dedup_threshold > 0
+                    and last_char is not None
+                    and _is_duplicate_char(last_char, character, char_dedup_threshold)
+                ):
+                    continue
+
+                last_char = character
                 characters.append(character)
                 char = character.get_text()
 
@@ -961,6 +1303,7 @@ def get_words_from_obj(
 
                 word += char
             else:
+                # Non-LTChar items (e.g., LTAnno) act as word boundaries
                 words.append(
                     {"text": word, "bbox": (x1, y1, x2, y2), "start_index": start_index},
                 )

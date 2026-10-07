@@ -48,7 +48,7 @@ fi
 
 SCENARIO="${1:-}"
 if [[ -z "$SCENARIO" ]]; then
-  echo "Usage: $0 [--cleanup] {baseline|missing-models|offline|offline-and-missing-models}" >&2
+  echo "Usage: $0 [--cleanup] {baseline|missing-models|analytics-online-only|offline|offline-and-missing-models}" >&2
   exit 1
 fi
 
@@ -66,7 +66,9 @@ REMOVE_CACHE=0
 case "$SCENARIO" in
 baseline) ;;
 missing-models) REMOVE_CACHE=1 ;;
-analytics-online-only) HF_HUB_OFFLINE=1 ;;
+analytics-online-only)
+  HF_HUB_OFFLINE=1
+  ;;
 offline)
   DO_NOT_TRACK=true
   HF_HUB_OFFLINE=1
@@ -127,8 +129,8 @@ fi
 
 docker exec -i -e PYTHONUNBUFFERED=1 "$CID" python - <<PY |& tee "${PY_LOG_DIR}/${SCENARIO}.log"
 import logging
+# Startup and per-partition runtime telemetry run unless the scenario sets DO_NOT_TRACK.
 from unstructured.partition.auto import partition
-from unstructured.logger import logger  # force analytics ping if not DO_NOT_TRACK
 import urllib.request, time, os, sys
 
 # Configure detailed logging
